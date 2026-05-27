@@ -35,6 +35,14 @@ DEFAULT_CONFIG = {
             "key": "space",
             "modifiers": ["Control"],
         },
+        "shuangpin": {
+            "enabled": False,
+            "scheme": "xiaohe",
+        },
+        "auto_request": {
+            "enabled": False,
+            "delay_ms": 1500,
+        },
     },
     "candidate": {
         "max_candidates": 5,
@@ -101,3 +109,11 @@ def load_config(path=CONFIG_PATH):
     with open(expanded_path, "r", encoding="utf-8") as f:
         user_config = json.load(f)
     return deep_merge(DEFAULT_CONFIG, user_config)
+
+
+def save_config(config_dict, path=CONFIG_PATH):
+    """Save a complete config dict to disk, creating directories as needed."""
+    expanded_path = os.path.expanduser(path)
+    os.makedirs(os.path.dirname(expanded_path), exist_ok=True)
+    with open(expanded_path, "w", encoding="utf-8") as f:
+        json.dump(config_dict, f, ensure_ascii=False, indent=2)

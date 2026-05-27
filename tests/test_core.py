@@ -410,6 +410,36 @@ def test_ctrl_digit_index_accepts_number_rows_and_keypad():
     assert engine.ctrl_digit_index(IBus.KEY_1, state=0) is None
 
 
+# -- Shuangpin tests -----------------------------------------------------
+
+def test_shuangpin_xiaohe_conversion():
+    from ibus_ai_pinyin.shuangpin import shuangpin_to_pinyin, SHUANGPIN_SCHEMES
+    assert "xiaohe" in SHUANGPIN_SCHEMES
+    # ni hao: n + i (ni) + h + c (hao) = "nihc"
+    assert shuangpin_to_pinyin("nihc", "xiaohe") == "ni hao"
+    # zhong wen: v + s (zhong) + w + f (wen) = "vswf"
+    assert shuangpin_to_pinyin("vswf", "xiaohe") == "zhong wen"
+    # wo: w + o (wo) = "wo"
+    result = shuangpin_to_pinyin("wo", "xiaohe")
+    assert "w" in result.lower()  # contains w- initial
+
+
+def test_shuangpin_conversion_preserves_incomplete():
+    from ibus_ai_pinyin.shuangpin import shuangpin_to_pinyin
+    # Odd-length buffer (3 chars) drops the last char, only 2 chars processed
+    result = shuangpin_to_pinyin("nih", "xiaohe")
+    assert result == "ni"
+
+
+def test_shuangpin_all_schemes_have_valid_mappings():
+    from ibus_ai_pinyin.shuangpin import SHUANGPIN_SCHEMES
+    from string import ascii_lowercase
+    for name, scheme in SHUANGPIN_SCHEMES.items():
+        for key in ascii_lowercase:
+            assert key in scheme["initials"], f"{name}: missing initial '{key}'"
+            assert key in scheme["finals"], f"{name}: missing final '{key}'"
+
+
 if __name__ == "__main__":
     test_parse_candidates()
     test_extract_complete_candidates_from_partial_json()
@@ -439,4 +469,7 @@ if __name__ == "__main__":
     test_candidate_page_char_shortcut_detects_plus_minus()
     test_candidate_page_key_accepts_shift_equal()
     test_ctrl_digit_index_accepts_number_rows_and_keypad()
+    test_shuangpin_xiaohe_conversion()
+    test_shuangpin_conversion_preserves_incomplete()
+    test_shuangpin_all_schemes_have_valid_mappings()
     print("ok")

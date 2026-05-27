@@ -12,3 +12,7 @@ env/
 
 .DS_Store
 dev/
+.claude/
+.codewhale/
+.vscode/
+.__pycache__/

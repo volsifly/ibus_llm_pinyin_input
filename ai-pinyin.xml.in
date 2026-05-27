@@ -3,7 +3,8 @@
   <name>org.freedesktop.IBus.AIPinyin</name>
   <description>AI Pinyin Input Method</description>
   <exec>__INSTALL_DIR__/run-engine.sh</exec>
-  <version>0.0.6</version>
+  <setup>__INSTALL_DIR__/ibus-setup-ai-pinyin</setup>
+  <version>0.0.7</version>
   <author>Volsifly</author>
   <license>MIT</license>
   <homepage>https://example.com</homepage>

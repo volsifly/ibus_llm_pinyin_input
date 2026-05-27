@@ -43,7 +43,7 @@ im-config -n ibus
 
 ```bash
 chmod +x scripts/install-user.sh
-./scripts/install-user.sh
+sudo ./scripts/install-user.sh
 ibus restart
 ```
 
@@ -75,6 +75,15 @@ ibus engine ai-pinyin
 ibus restart
 ibus engine ai-pinyin
 ```
+
+**推荐方式**：通过 IBus 面板或输入法列表中的 **Preferences（首选项）** 按钮打开图形化设置窗口（v0.0.7+），包含以下配置页：
+
+- **API** — 服务地址、密钥、模型、超时等
+- **输入** — 缓冲区长度、每页候选数、默认模式、切换快捷键
+- **候选** — 最大候选词数量、回退行为
+- **高级** — 缓存、领域词典、用户记忆、调试开关、提示词
+
+也可以直接编辑 `~/.config/ibus-ai-pinyin/config.json`。
 
 默认配置使用本地 OpenAI-compatible 服务：
 
@@ -206,6 +215,52 @@ IBus 状态栏/面板会显示当前模式：
 
 状态显示通过 IBus component 的 `icon_prop_key=InputMode` 和引擎内同名 property 实现。
 
+### 双拼支持
+
+输入法支持四种双拼方案，启用后每两个按键对应一个拼音音节：
+
+```json
+{
+  "input": {
+    "shuangpin": {
+      "enabled": true,
+      "scheme": "xiaohe"
+    }
+  }
+}
+```
+
+`scheme` 可选值：
+
+| 值 | 方案 |
+|---|---|
+| `xiaohe` | 小鹤双拼 |
+| `ziranma` | 自然码 |
+| `microsoft` | 微软双拼 |
+| `sogou` | 搜狗双拼 |
+
+启用双拼后，缓冲区只接受小写英文字母，空格和标点不会进入缓冲区。
+
+### 自动请求
+
+启用后，打字停顿指定时间后自动触发候选词请求，无需手动按空格：
+
+```json
+{
+  "input": {
+    "auto_request": {
+      "enabled": true,
+      "delay_ms": 1500
+    }
+  }
+}
+```
+
+- `enabled` — 是否开启自动请求（默认 `false`）
+- `delay_ms` — 停顿多少毫秒后触发（默认 `1500`，即 1.5 秒）
+
+自动请求仅在缓冲区非空、无候选显示、未处于编辑模式时触发。
+
 例如改成 `Alt+Space`：
 
 ```json
@@ -251,7 +306,7 @@ llama-server \
 输入 nihao
 按空格请求候选
 候选不准确时继续输入补充说明，再按空格调整候选
-按 - 或 = 排除当前候选并生成下一组候选
+按 - 或 = 翻页加载更多候选（优先从缓存和本地词库获取，不足时请求 LLM）
 按 1-9 选择候选
 按 Ctrl+1 到 Ctrl+9 修改对应候选
 按空格提交当前第一个候选
@@ -452,6 +507,7 @@ truncate -s 0 ~/.cache/ibus-ai-pinyin/engine.log
 ```
 
 ## 开发验证
+### 请务必保证 python 版本 >= 3.10
 
 ```bash
 python3 -m py_compile engine.py ibus_ai_pinyin/*.py tests/*.py

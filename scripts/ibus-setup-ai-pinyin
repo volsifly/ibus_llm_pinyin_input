@@ -18,4 +18,4 @@ if ! "${PYTHON}" -c "import gi" 2>/dev/null; then
   done
 fi
 
-exec "${PYTHON}" "${INSTALL_DIR}/engine.py"
+exec "${PYTHON}" "${INSTALL_DIR}/preferences.py"

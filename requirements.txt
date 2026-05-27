@@ -1,0 +1,24 @@
+# ============================================================
+# IBus LLM Pinyin Input — Python 依赖
+# ============================================================
+# ！！！ python版本必须大于3.10 ！！！ 
+# 安装方式：
+#   pip install -r requirements.txt
+#
+# 如果不需要调试功能（engine.py 中的 debugpy），可先注释掉
+# 最后一行再安装。
+# ============================================================
+
+# HTTP 客户端，用于调用 LLM API
+requests>=2.28.0
+
+# gi.repository (IBus / GLib 绑定)
+# 系统备选：sudo apt install python3-gi
+# 注意：gi 模块（PyGObject）依赖系统 C 库，pip 安装前需先
+# 安装以下系统包：
+#   sudo apt update
+#   sudo apt install -y ibus python3-gi gir1.2-ibus-1.0 libgirepository-2.0-dev
+PyGObject>=3.42.0
+
+# 调试支持（可选）
+debugpy>=1.6.0

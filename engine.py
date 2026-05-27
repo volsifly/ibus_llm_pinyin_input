@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import logging
 import os
+import subprocess
 import threading
 
 import gi
@@ -20,6 +21,7 @@ from ibus_ai_pinyin.user_memory import UserMemoryStore
 
 LOG_PATH = os.path.expanduser("~/.cache/ibus-ai-pinyin/engine.log")
 INPUT_MODE_PROP_KEY = "InputMode"
+SETUP_PROP_KEY = "Setup"
 PASSTHROUGH_MODIFIERS = (
     IBus.ModifierType.CONTROL_MASK
     | IBus.ModifierType.MOD1_MASK
@@ -100,6 +102,7 @@ class AIPinyinEngine(IBus.Engine):
         self.input_cfg = self.config.get("input", {})
         self.zh_mode = self.input_cfg.get("default_mode", "zh") != "en"
         self.toggle_key = self.input_cfg.get("toggle_key", {})
+        self._auto_request_timer_id = 0
         self.edit_mode = False
         self.edit_text = ""
         self.edit_cursor = 0
@@ -232,6 +235,7 @@ class AIPinyinEngine(IBus.Engine):
             if self.buffer:
                 self.buffer = self.buffer[:-1]
                 self.update_composition_ui()
+                self._reset_auto_request_timer()
                 return True
             return False
 
@@ -273,6 +277,7 @@ class AIPinyinEngine(IBus.Engine):
                 self.reset_candidate_page_history()
                 self.hide_lookup_table()
                 self.update_composition_ui()
+                self._reset_auto_request_timer()
                 logging.debug("buffer appended buffer_len=%s", len(self.buffer))
                 return True
 
@@ -287,6 +292,7 @@ class AIPinyinEngine(IBus.Engine):
                 self.reset_candidate_page_history()
                 self.hide_lookup_table()
                 self.update_composition_ui()
+                self._reset_auto_request_timer()
                 logging.debug("buffer symbol appended buffer_len=%s", len(self.buffer))
                 return True
 
@@ -299,10 +305,34 @@ class AIPinyinEngine(IBus.Engine):
 
         return False
 
+    def _get_pinyin_from_buffer(self):
+        """Convert the raw buffer to a pinyin string for LLM requests.
+
+        In shuangpin mode the buffer holds 2-keystroke syllables
+        that need to be converted to full pinyin.
+        """
+        shuangpin_cfg = self._shuangpin_cfg()
+        if shuangpin_cfg.get("enabled", False):
+            from ibus_ai_pinyin.shuangpin import shuangpin_to_pinyin
+            return shuangpin_to_pinyin(self.buffer, shuangpin_cfg["scheme"])
+        return " ".join(self.buffer.split())
+
+    def _shuangpin_cfg(self):
+        input_cfg = getattr(self, "input_cfg", None)
+        if input_cfg is None:
+            return {}
+        return input_cfg.get("shuangpin", {})
+
     def accept_char(self, ch):
+        if self._shuangpin_cfg().get("enabled", False):
+            # In shuangpin mode only lowercase ASCII letters are accepted
+            return ch.isascii() and ch.isalpha() and ch.islower()
         return ch.isascii() and (ch.isalnum() or ch in ["'", " "])
 
     def accept_inline_symbol(self, ch):
+        if self._shuangpin_cfg().get("enabled", False):
+            # In shuangpin mode inline symbols break the 2-char syllable pattern
+            return False
         return ch.isascii() and ch.isprintable() and not ch.isalnum() and not ch.isspace()
 
     def should_passthrough_initial_char(self, ch):
@@ -368,9 +398,45 @@ class AIPinyinEngine(IBus.Engine):
         self.update_mode_property()
         logging.info("input mode toggled mode=%s", "zh" if self.zh_mode else "en")
 
+    # ── Auto-request timer (debounce) ──────────────────────────────
+
+    def _reset_auto_request_timer(self):
+        """Reset the one-shot auto-request timer. Call on every buffer change."""
+        if self._auto_request_timer_id:
+            GLib.source_remove(self._auto_request_timer_id)
+            self._auto_request_timer_id = 0
+
+        cfg = self.input_cfg.get("auto_request", {})
+        if not cfg.get("enabled", False):
+            return
+        if not self.buffer or self.candidates or self.edit_mode or self.is_requesting:
+            return
+
+        delay = cfg.get("delay_ms", 1500)
+        self._auto_request_timer_id = GLib.timeout_add(
+            delay, self._on_auto_request_timer
+        )
+
+    def _on_auto_request_timer(self):
+        """Fires when the user has stopped typing for the configured delay."""
+        self._auto_request_timer_id = 0
+        if not self.buffer or self.candidates or self.edit_mode or self.is_requesting:
+            return False
+        self.request_candidates()
+        return False  # one-shot
+
+    def _cancel_auto_request_timer(self):
+        """Cancel the auto-request timer without firing."""
+        if self._auto_request_timer_id:
+            GLib.source_remove(self._auto_request_timer_id)
+            self._auto_request_timer_id = 0
+
+    # ────────────────────────────────────────────────────────────────
+
     def register_mode_property(self):
         prop_list = IBus.PropList()
         prop_list.append(self.create_mode_property())
+        prop_list.append(self.create_setup_property())
         self.register_properties(prop_list)
         logging.debug("mode property registered mode=%s", "zh" if self.zh_mode else "en")
 
@@ -394,6 +460,31 @@ class AIPinyinEngine(IBus.Engine):
             symbol=symbol,
         )
         return prop
+
+    def create_setup_property(self):
+        prop = IBus.Property(
+            key=SETUP_PROP_KEY,
+            type=IBus.PropType.NORMAL,
+            label="首选项 ⚙",
+            icon="",
+            tooltip="打开首选项",
+            sensitive=True,
+            visible=True,
+            state=IBus.PropState.UNCHECKED,
+            symbol="⚙",
+        )
+        return prop
+
+    def do_property_activate(self, prop_name, prop_state):
+        if prop_name == SETUP_PROP_KEY:
+            setup_script = os.path.expanduser(
+                "~/.local/share/ibus-ai-pinyin/ibus-setup-ai-pinyin"
+            )
+            try:
+                subprocess.Popen([setup_script])
+            except Exception as exc:
+                logging.warning("failed to launch setup: %s", exc)
+        super().do_property_activate(prop_name, prop_state)
 
     def update_composition_ui(self, suffix=""):
         self.update_preedit_text(IBus.Text.new_from_string(""), 0, False)
@@ -424,7 +515,7 @@ class AIPinyinEngine(IBus.Engine):
         self.update_auxiliary_text(IBus.Text.new_from_string("候选修改"), True)
 
     def start_candidate_edit(self, index):
-        pinyin = " ".join(self.buffer.split())
+        pinyin = self._get_pinyin_from_buffer()
         self.edit_mode = True
         self.edit_text = self.candidates[index]
         self.edit_cursor = len(self.edit_text)
@@ -620,7 +711,7 @@ class AIPinyinEngine(IBus.Engine):
         if self.is_requesting:
             return
 
-        pinyin = " ".join(self.buffer.split())
+        pinyin = self._get_pinyin_from_buffer()
         max_candidates = self.config.get("candidate", {}).get("max_candidates", 5)
         logging.info("candidate request started chars=%s", len(pinyin))
 
@@ -705,7 +796,7 @@ class AIPinyinEngine(IBus.Engine):
         self.request_more_candidates()
 
     def show_previous_candidate_page(self):
-        pinyin = " ".join(self.buffer.split())
+        pinyin = self._get_pinyin_from_buffer()
         self.ensure_candidate_page_history(pinyin)
         if self.candidate_page_index <= 0:
             logging.info("candidate previous page ignored at first page")
@@ -723,18 +814,57 @@ class AIPinyinEngine(IBus.Engine):
         self.show_candidates(page)
 
     def request_more_candidates(self):
-        pinyin = " ".join(self.buffer.split())
+        pinyin = self._get_pinyin_from_buffer()
         if not pinyin or not self.candidates:
             return
         self.ensure_candidate_page_history(pinyin)
         self.candidate_note_buffer = ""
         max_candidates = self.config.get("candidate", {}).get("max_candidates", 5)
         excluded_candidates = self.get_all_candidate_page_items()
+        excluded_set = set(excluded_candidates)
+
+        # 1. Check local sources before hitting LLM (cache-first pagination)
+        local_found = []
+
+        if self.cache_enabled:
+            cached_all = self.cache.get(pinyin, limit=max_candidates * 5)
+            local_found.extend(c for c in cached_all if c not in excluded_set)
+
+        if self.memory_enabled and self.memory_cfg.get("exact_match_candidate", True):
+            try:
+                mem_candidates = self.user_memory.get_exact_candidates(
+                    pinyin, limit=max_candidates
+                )
+                excluded_set.update(local_found)
+                local_found.extend(c for c in mem_candidates if c not in excluded_set)
+            except Exception:
+                pass
+
+        try:
+            local_cands = get_local_candidates(pinyin, limit=max_candidates)
+            excluded_set.update(local_found)
+            local_found.extend(c for c in local_cands if c not in excluded_set)
+        except Exception:
+            pass
+
+        merged_local = list(dict.fromkeys(local_found))[:max_candidates]
+
+        if len(merged_local) >= max_candidates:
+            # Enough from local sources — skip LLM
+            logging.info(
+                "more candidates from local sources pinyin_chars=%s found=%s",
+                len(pinyin),
+                len(merged_local),
+            )
+            self._append_new_candidate_page(merged_local)
+            return
+
         logging.info(
-            "more candidates request started pinyin_chars=%s pages=%s excluded=%s",
+            "more candidates request started pinyin_chars=%s pages=%s excluded=%s local=%s",
             len(pinyin),
             len(self.candidate_pages),
             len(excluded_candidates),
+            len(merged_local),
         )
 
         self.is_requesting = True
@@ -744,9 +874,17 @@ class AIPinyinEngine(IBus.Engine):
 
         threading.Thread(
             target=self.fetch_more_candidates_worker,
-            args=(request_id, pinyin, excluded_candidates, max_candidates),
+            args=(request_id, pinyin, excluded_candidates, max_candidates, merged_local),
             daemon=True,
         ).start()
+
+    def _append_new_candidate_page(self, candidates):
+        """Add a new page of candidates to history and display it."""
+        self.candidate_pages = self.candidate_pages[: self.candidate_page_index + 1]
+        self.candidate_pages.append(list(candidates))
+        self.candidate_page_index = len(self.candidate_pages) - 1
+        self.selected_index = 0
+        self.show_candidates(candidates)
 
     def fetch_more_candidates_worker(
         self,
@@ -754,6 +892,7 @@ class AIPinyinEngine(IBus.Engine):
         pinyin,
         excluded_candidates,
         max_candidates,
+        local_found=None,
     ):
         try:
             candidates = self.llm.get_more_candidates(
@@ -764,10 +903,12 @@ class AIPinyinEngine(IBus.Engine):
         except Exception as exc:
             logging.warning("LLM more candidates request failed: %s", exc)
             candidates = []
+        if local_found:
+            candidates = merge_candidates(local_found, candidates, limit=max_candidates)
         GLib.idle_add(self.on_more_candidates_ready, request_id, pinyin, excluded_candidates, candidates)
 
     def request_refined_candidates(self):
-        pinyin = " ".join(self.buffer.split())
+        pinyin = self._get_pinyin_from_buffer()
         instruction = " ".join(self.candidate_note_buffer.split())
         if not pinyin or not instruction or not self.candidates:
             return
@@ -899,7 +1040,7 @@ class AIPinyinEngine(IBus.Engine):
         dictionary_context,
         max_candidates,
     ):
-        current = " ".join(self.buffer.split())
+        current = self._get_pinyin_from_buffer()
         if request_id != self.request_id or current != pinyin:
             return False
 
@@ -924,7 +1065,7 @@ class AIPinyinEngine(IBus.Engine):
     def on_candidates_ready(self, request_id, pinyin, candidates):
         self.is_requesting = False
 
-        current = " ".join(self.buffer.split())
+        current = self._get_pinyin_from_buffer()
         if request_id != self.request_id or current != pinyin:
             return False
 
@@ -943,7 +1084,7 @@ class AIPinyinEngine(IBus.Engine):
     def on_more_candidates_ready(self, request_id, pinyin, excluded_candidates, candidates):
         self.is_requesting = False
 
-        current = " ".join(self.buffer.split())
+        current = self._get_pinyin_from_buffer()
         if request_id != self.request_id or current != pinyin:
             return False
 
@@ -967,7 +1108,7 @@ class AIPinyinEngine(IBus.Engine):
     def on_refined_candidates_ready(self, request_id, pinyin, instruction, candidates):
         self.is_requesting = False
 
-        current = " ".join(self.buffer.split())
+        current = self._get_pinyin_from_buffer()
         current_instruction = " ".join(self.candidate_note_buffer.split())
         if request_id != self.request_id or current != pinyin or current_instruction != instruction:
             return False
@@ -1043,7 +1184,7 @@ class AIPinyinEngine(IBus.Engine):
         if not self.candidates or index >= len(self.candidates):
             return
 
-        pinyin = " ".join(self.buffer.split())
+        pinyin = self._get_pinyin_from_buffer()
         text = self.candidates[index]
         self.commit_text(IBus.Text.new_from_string(text))
         self.record_recent_committed_candidate(text)
@@ -1098,6 +1239,7 @@ class AIPinyinEngine(IBus.Engine):
         self.buffer = ""
         self.candidates = []
         self.candidate_note_buffer = ""
+        self._cancel_auto_request_timer()
         self.reset_candidate_page_history()
         self.selected_index = 0
         self.is_requesting = False
