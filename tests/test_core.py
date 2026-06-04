@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -49,11 +50,80 @@ def test_extract_complete_candidates_from_partial_json():
 
 def test_build_request_body_includes_recent_committed_text():
     client = LLMClient({"api": {}, "prompt": {}})
-    body = client.build_request_body("jixu", recent_committed_text="鸿灵 知识库")
-    user_content = body["messages"][1]["content"]
-    assert "拼音：jixu" in user_content
-    assert "最近已输入中文：鸿灵 知识库" in user_content
-    assert "不是当前拼音" in user_content
+    body = client.build_request_body(
+        "jixu",
+        recent_committed_turns=[
+            {"pinyin": "hongling", "text": "鸿灵"},
+            {"pinyin": "zhishiku", "text": "知识库"},
+        ],
+    )
+
+    assert body["messages"][1] == {
+        "role": "user",
+        "content": "拼音：hongling\n请输出中文候选 JSON 数组。",
+    }
+    assert body["messages"][2] == {"role": "assistant", "content": "[\"鸿灵\"]"}
+    assert body["messages"][3] == {
+        "role": "user",
+        "content": "拼音：zhishiku\n请输出中文候选 JSON 数组。",
+    }
+    assert body["messages"][4] == {"role": "assistant", "content": "[\"知识库\"]"}
+    assert body["messages"][-1]["role"] == "user"
+    assert "拼音：jixu" in body["messages"][-1]["content"]
+
+
+def test_deepseek_request_body_uses_cache_friendly_layout():
+    client = LLMClient(
+        {
+            "api": {
+                "base_url": "https://api.deepseek.com",
+                "model": "deepseek-v4-flash",
+                "stream": True,
+            },
+            "prompt": {},
+        }
+    )
+    body = client.build_request_body(
+        "hongling",
+        dictionary_context=[{"text": "鸿灵知识库", "pinyin": "hong ling zhi shi ku"}],
+        recent_committed_turns=[{"pinyin": "jixu", "text": "继续"}],
+        stream=True,
+    )
+    user_content = body["messages"][-1]["content"]
+
+    assert body["messages"][1] == {
+        "role": "user",
+        "content": "拼音：jixu\n请输出中文候选 JSON 数组。",
+    }
+    assert body["messages"][2] == {"role": "assistant", "content": "[\"继续\"]"}
+    assert user_content.index("输出要求") < user_content.index("领域词库命中")
+    assert user_content.index("领域词库命中") < user_content.index("当前拼音：hongling")
+    assert body["stream_options"] == {"include_usage": True}
+
+
+def test_deepseek_cache_layout_can_be_disabled():
+    client = LLMClient(
+        {
+            "api": {
+                "base_url": "https://api.deepseek.com",
+                "model": "deepseek-v4-flash",
+                "cache_optimization": False,
+            },
+            "prompt": {},
+        }
+    )
+    body = client.build_request_body(
+        "hongling",
+        recent_committed_turns=[{"pinyin": "jixu", "text": "继续"}],
+    )
+    user_content = body["messages"][-1]["content"]
+
+    assert body["messages"][1] == {
+        "role": "user",
+        "content": "拼音：jixu\n请输出中文候选 JSON 数组。",
+    }
+    assert body["messages"][2] == {"role": "assistant", "content": "[\"继续\"]"}
+    assert "拼音：hongling" in user_content
 
 
 def test_cache_promote():
@@ -62,6 +132,10 @@ def test_cache_promote():
         cache.put_many("nihao", ["你好", "你号"])
         cache.promote("nihao", "你号")
         assert cache.get("nihao", limit=2) == ["你号", "你好"]
+        assert cache.has("nihao", "你号")
+        assert cache.delete("nihao", "你号") == 1
+        assert not cache.has("nihao", "你号")
+        assert cache.get("nihao", limit=2) == ["你好"]
 
 
 def test_local_candidates():
@@ -354,29 +428,146 @@ def test_previous_candidate_page_reads_history_without_request():
     assert shown == [["你好", "你号"]]
 
 
+def test_cached_candidate_label_and_delete_selected():
+    class FakeCache:
+        def __init__(self):
+            self.deleted = []
+
+        def delete(self, pinyin, candidate):
+            self.deleted.append((pinyin, candidate))
+            return 1
+
+    engine = AIPinyinEngine.__new__(AIPinyinEngine)
+    engine.buffer = "nihao"
+    engine.candidates = ["你好", "你号", "拟好"]
+    engine.selected_index = 1
+    engine.cache_enabled = True
+    engine.cache = FakeCache()
+    engine.cached_candidate_labels = {"你好", "你号"}
+    engine.candidate_pages = [["你好", "你号", "拟好"]]
+    engine.candidate_page_index = 0
+    shown = []
+    hidden = []
+    engine.show_candidates = lambda candidates: shown.append(list(candidates))
+    engine.hide_lookup_table = lambda: hidden.append(True)
+    engine.update_composition_ui = lambda suffix="": None
+
+    assert engine.format_candidate_label("你好") == "你好 *"
+    assert engine.format_candidate_label("拟好") == "拟好"
+    assert engine.delete_selected_cached_candidate() is True
+
+    assert engine.cache.deleted == [("nihao", "你号")]
+    assert engine.candidates == ["你好", "拟好"]
+    assert engine.candidate_pages == [["你好", "拟好"]]
+    assert "你号" not in engine.cached_candidate_labels
+    assert shown == [["你好", "拟好"]]
+    assert hidden == []
+
+
+def test_cache_writes_only_after_user_selection():
+    class FakeCache:
+        def __init__(self):
+            self.puts = []
+            self.promotes = []
+
+        def put_many(self, pinyin, candidates, source="llm"):
+            self.puts.append((pinyin, list(candidates), source))
+
+        def promote(self, pinyin, candidate):
+            self.promotes.append((pinyin, candidate))
+
+    engine = AIPinyinEngine.__new__(AIPinyinEngine)
+    engine.buffer = "nihao"
+    engine.request_id = 7
+    engine.is_requesting = True
+    engine.cache_enabled = True
+    engine.cache = FakeCache()
+    engine.candidate_pages_pinyin = ""
+    engine.candidate_pages = []
+    engine.candidate_page_index = 0
+    shown = []
+    committed = []
+
+    def show_candidates(candidates):
+        engine.candidates = list(candidates)
+        shown.append(list(candidates))
+
+    engine.show_candidates = show_candidates
+    engine.commit_text = lambda text: committed.append(text.get_text())
+    engine.record_recent_committed_candidate = lambda pinyin, text: None
+    engine.clear_all = lambda: None
+
+    assert engine.on_candidates_ready(7, "nihao", ["你好", "你号"]) is False
+    assert engine.cache.puts == []
+    assert engine.cache.promotes == []
+    assert shown == [["你好", "你号"]]
+
+    engine.commit_candidate(1)
+
+    assert committed == ["你号"]
+    assert engine.cache.puts == [("nihao", ["你号"], "user_selected")]
+    assert engine.cache.promotes == [("nihao", "你号")]
+
+
 def test_recent_committed_context_records_candidates_only():
     engine = AIPinyinEngine.__new__(AIPinyinEngine)
-    engine.config = {"input": {"recent_context_items": 3, "recent_context_chars": 10}}
-    engine.recent_committed_candidates = []
+    engine.config = {"input": {"recent_context_items": 3, "recent_context_chars": 40}}
+    engine.recent_committed_turns = []
 
-    engine.record_recent_committed_candidate("你好")
-    engine.record_recent_committed_candidate("世界")
-    engine.record_recent_committed_candidate("继续")
+    engine.record_recent_committed_candidate("nihao", "你好")
+    engine.record_recent_committed_candidate("shijie", "世界")
+    engine.record_recent_committed_candidate("jixu", "继续")
 
-    assert engine.get_recent_committed_context() == "你好 世界 继续"
+    assert engine.get_recent_committed_context() == [
+        {"pinyin": "nihao", "text": "你好"},
+        {"pinyin": "shijie", "text": "世界"},
+        {"pinyin": "jixu", "text": "继续"},
+    ]
 
 
 def test_recent_committed_context_respects_limits():
     engine = AIPinyinEngine.__new__(AIPinyinEngine)
-    engine.config = {"input": {"recent_context_items": 2, "recent_context_chars": 4}}
-    engine.recent_committed_candidates = []
+    engine.config = {"input": {"recent_context_items": 2, "recent_context_chars": 10}}
+    engine.recent_committed_turns = []
 
-    engine.record_recent_committed_candidate("你好")
-    engine.record_recent_committed_candidate("世界")
-    engine.record_recent_committed_candidate("继续")
+    engine.record_recent_committed_candidate("nihao", "你好")
+    engine.record_recent_committed_candidate("shijie", "世界")
+    engine.record_recent_committed_candidate("jixu", "继续")
 
-    assert engine.recent_committed_candidates == ["世界", "继续"]
-    assert engine.get_recent_committed_context() == "继续"
+    assert engine.recent_committed_turns == [
+        {"pinyin": "shijie", "text": "世界"},
+        {"pinyin": "jixu", "text": "继续"},
+    ]
+    assert engine.get_recent_committed_context() == [{"pinyin": "jixu", "text": "继续"}]
+
+
+def test_recent_committed_context_defaults_to_30_turns_without_char_limit():
+    engine = AIPinyinEngine.__new__(AIPinyinEngine)
+    engine.config = {"input": {"recent_context_items": 30, "recent_context_chars": 0}}
+    engine.recent_committed_turns = []
+
+    for index in range(35):
+        engine.record_recent_committed_candidate(
+            f"pinyin{index}",
+            f"很长的中文选择结果{index}",
+        )
+
+    context = engine.get_recent_committed_context()
+    assert len(context) == 30
+    assert context[0] == {"pinyin": "pinyin5", "text": "很长的中文选择结果5"}
+    assert context[-1] == {"pinyin": "pinyin34", "text": "很长的中文选择结果34"}
+
+
+def test_recent_committed_context_clears_after_idle_timeout():
+    engine = AIPinyinEngine.__new__(AIPinyinEngine)
+    engine.config = {"input": {"recent_context_idle_timeout_seconds": 1800}}
+    engine.recent_committed_turns = [{"pinyin": "nihao", "text": "你好"}]
+    engine.last_input_activity_at = time.monotonic() - 1801
+
+    engine.note_input_activity()
+
+    assert engine.recent_committed_turns == []
+    assert engine.last_input_activity_at > 0
 
 
 def test_candidate_page_char_shortcut_detects_plus_minus():
@@ -414,6 +605,8 @@ if __name__ == "__main__":
     test_parse_candidates()
     test_extract_complete_candidates_from_partial_json()
     test_build_request_body_includes_recent_committed_text()
+    test_deepseek_request_body_uses_cache_friendly_layout()
+    test_deepseek_cache_layout_can_be_disabled()
     test_cache_promote()
     test_local_candidates()
     test_merge_candidates_keeps_source_order_and_dedupes()
@@ -434,8 +627,12 @@ if __name__ == "__main__":
     test_more_candidates_keeps_current_page_when_empty()
     test_more_candidates_appends_page_history_and_filters_all_previous()
     test_previous_candidate_page_reads_history_without_request()
+    test_cached_candidate_label_and_delete_selected()
+    test_cache_writes_only_after_user_selection()
     test_recent_committed_context_records_candidates_only()
     test_recent_committed_context_respects_limits()
+    test_recent_committed_context_defaults_to_30_turns_without_char_limit()
+    test_recent_committed_context_clears_after_idle_timeout()
     test_candidate_page_char_shortcut_detects_plus_minus()
     test_candidate_page_key_accepts_shift_equal()
     test_ctrl_digit_index_accepts_number_rows_and_keypad()

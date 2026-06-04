@@ -21,6 +21,7 @@ class LLMClient:
         self.proxy_enabled = api.get("proxy_enabled", False)
         self.thinking = api.get("thinking", {})
         self.extra_body = api.get("extra_body", {})
+        self.cache_optimization = api.get("cache_optimization", {})
 
         api_key = api.get("api_key", "")
         api_key_env = api.get("api_key_env", "OPENAI_API_KEY")
@@ -41,8 +42,50 @@ class LLMClient:
         pinyin,
         dictionary_context=None,
         recent_committed_text=None,
+        recent_committed_turns=None,
         stream=None,
     ):
+        messages = self.build_messages(
+            pinyin,
+            dictionary_context=dictionary_context or [],
+            recent_committed_text=recent_committed_text or "",
+            recent_committed_turns=recent_committed_turns or [],
+        )
+        return self.build_chat_body(messages, stream=stream)
+
+    def build_messages(
+        self,
+        pinyin,
+        dictionary_context=None,
+        recent_committed_text=None,
+        recent_committed_turns=None,
+    ):
+        messages = [{"role": "system", "content": self.system_prompt}]
+        for turn in self.format_recent_committed_turns(recent_committed_turns or []):
+            messages.append({"role": "user", "content": self.user_template.format(pinyin=turn["pinyin"])})
+            messages.append({"role": "assistant", "content": json.dumps([turn["text"]], ensure_ascii=False)})
+
+        user_content = self.build_user_content(
+            pinyin,
+            dictionary_context=dictionary_context or [],
+            recent_committed_text=recent_committed_text or "",
+        )
+        messages.append({"role": "user", "content": user_content})
+        return messages
+
+    def build_user_content(
+        self,
+        pinyin,
+        dictionary_context=None,
+        recent_committed_text=None,
+    ):
+        if self.should_use_deepseek_cache_layout():
+            return self.build_deepseek_cache_user_content(
+                pinyin,
+                dictionary_context=dictionary_context or [],
+                recent_committed_text=recent_committed_text or "",
+            )
+
         user_content = self.user_template.format(pinyin=pinyin)
         recent_text = self.format_recent_committed_text(recent_committed_text or "")
         if recent_text:
@@ -50,13 +93,38 @@ class LLMClient:
         context_text = self.format_dictionary_context(dictionary_context or [])
         if context_text:
             user_content = f"{user_content}\n\n{context_text}"
+        return user_content
 
-        body = {
-            "model": self.model,
-            "messages": [
+    def build_deepseek_cache_user_content(
+        self,
+        pinyin,
+        dictionary_context=None,
+        recent_committed_text=None,
+    ):
+        sections = [
+            "任务：将当前拼音转换为最可能的中文候选。",
+            "输出要求：只输出 JSON 字符串数组，不要解释，不要 Markdown，不要代码块；最多输出 5 个候选。",
+        ]
+        recent_text = self.format_recent_committed_text(recent_committed_text or "")
+        if recent_text:
+            sections.append(recent_text)
+        context_text = self.format_dictionary_context(dictionary_context or [])
+        if context_text:
+            sections.append(context_text)
+        sections.append(f"当前拼音：{pinyin}\n请输出中文候选 JSON 数组。")
+        return "\n\n".join(sections)
+
+    def build_chat_body(self, user_content, stream=None):
+        if isinstance(user_content, list):
+            messages = user_content
+        else:
+            messages = [
                 {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": user_content},
-            ],
+            ]
+        body = {
+            "model": self.model,
+            "messages": messages,
             "temperature": self.temperature,
             "top_p": self.top_p,
             "max_tokens": self.max_tokens,
@@ -68,7 +136,58 @@ class LLMClient:
             body["thinking"] = {"type": self.thinking.get("type", "disabled")}
         elif isinstance(self.thinking, dict) and self.thinking.get("enabled") is True:
             body["thinking"] = {"type": self.thinking.get("type", "enabled")}
+        if body.get("stream") and self.should_log_deepseek_cache_usage():
+            stream_options = body.get("stream_options")
+            if not isinstance(stream_options, dict):
+                stream_options = {}
+            stream_options["include_usage"] = True
+            body["stream_options"] = stream_options
         return body
+
+    def should_use_deepseek_cache_layout(self):
+        if not self.is_deepseek_request():
+            return False
+        setting = self.cache_optimization
+        if isinstance(setting, bool):
+            return setting
+        if not isinstance(setting, dict):
+            return True
+        enabled = setting.get("enabled", "auto")
+        return enabled in (True, "auto")
+
+    def should_log_deepseek_cache_usage(self):
+        if not self.is_deepseek_request():
+            return False
+        setting = self.cache_optimization
+        if isinstance(setting, dict):
+            return setting.get("log_usage", True)
+        return True
+
+    def is_deepseek_request(self):
+        provider = ""
+        if isinstance(self.cache_optimization, dict):
+            provider = str(self.cache_optimization.get("provider", "")).lower()
+        if provider:
+            return provider == "deepseek"
+        return "deepseek" in self.base_url.lower() or "deepseek" in self.model.lower()
+
+    def log_usage(self, usage, label="LLM"):
+        if not isinstance(usage, dict):
+            return
+        hit = usage.get("prompt_cache_hit_tokens")
+        miss = usage.get("prompt_cache_miss_tokens")
+        if hit is None and miss is None:
+            return
+        prompt_tokens = usage.get("prompt_tokens")
+        total_tokens = usage.get("total_tokens")
+        logging.info(
+            "%s DeepSeek cache usage prompt_tokens=%s cache_hit=%s cache_miss=%s total_tokens=%s",
+            label,
+            prompt_tokens,
+            hit,
+            miss,
+            total_tokens,
+        )
 
     def get_candidates(
         self,
@@ -76,11 +195,13 @@ class LLMClient:
         max_candidates=5,
         dictionary_context=None,
         recent_committed_text=None,
+        recent_committed_turns=None,
     ):
         body = self.build_request_body(
             pinyin,
             dictionary_context=dictionary_context or [],
             recent_committed_text=recent_committed_text or "",
+            recent_committed_turns=recent_committed_turns or [],
         )
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -128,6 +249,7 @@ class LLMClient:
         finally:
             session.close()
         data = resp.json()
+        self.log_usage(data.get("usage"), label="LLM")
         message = data["choices"][0]["message"]
         content = message.get("content") or ""
         if not content:
@@ -157,23 +279,7 @@ class LLMClient:
             "请结合补充说明，输出新的中文候选 JSON 数组。"
             "优先保留正确候选，只调整不符合说明的候选，不要解释，不要 Markdown。"
         )
-        body = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-            "max_tokens": self.max_tokens,
-            "stream": False,
-        }
-        if isinstance(self.extra_body, dict):
-            body.update(self.extra_body)
-        if isinstance(self.thinking, dict) and self.thinking.get("enabled") is False:
-            body["thinking"] = {"type": self.thinking.get("type", "disabled")}
-        elif isinstance(self.thinking, dict) and self.thinking.get("enabled") is True:
-            body["thinking"] = {"type": self.thinking.get("type", "enabled")}
+        body = self.build_chat_body(user_content, stream=False)
         logging.info("LLM refinement user content=%r", user_content)
 
         headers = {
@@ -217,6 +323,7 @@ class LLMClient:
             session.close()
 
         data = resp.json()
+        self.log_usage(data.get("usage"), label="LLM refinement")
         message = data["choices"][0]["message"]
         content = message.get("content") or message.get("reasoning_content") or ""
         logging.info(
@@ -241,23 +348,7 @@ class LLMClient:
             "请生成一组新的中文候选 JSON 数组。"
             "不要输出排除列表里已有的候选，不要解释，不要 Markdown。"
         )
-        body = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            "temperature": self.temperature,
-            "top_p": self.top_p,
-            "max_tokens": self.max_tokens,
-            "stream": False,
-        }
-        if isinstance(self.extra_body, dict):
-            body.update(self.extra_body)
-        if isinstance(self.thinking, dict) and self.thinking.get("enabled") is False:
-            body["thinking"] = {"type": self.thinking.get("type", "disabled")}
-        elif isinstance(self.thinking, dict) and self.thinking.get("enabled") is True:
-            body["thinking"] = {"type": self.thinking.get("type", "enabled")}
+        body = self.build_chat_body(user_content, stream=False)
         logging.info("LLM more candidates user content=%r", user_content)
 
         headers = {
@@ -301,6 +392,7 @@ class LLMClient:
             session.close()
 
         data = resp.json()
+        self.log_usage(data.get("usage"), label="LLM more candidates")
         message = data["choices"][0]["message"]
         content = message.get("content") or message.get("reasoning_content") or ""
         logging.info(
@@ -322,11 +414,13 @@ class LLMClient:
         max_candidates=5,
         dictionary_context=None,
         recent_committed_text=None,
+        recent_committed_turns=None,
     ):
         body = self.build_request_body(
             pinyin,
             dictionary_context=dictionary_context or [],
             recent_committed_text=recent_committed_text or "",
+            recent_committed_turns=recent_committed_turns or [],
             stream=True,
         )
         headers = {
@@ -383,6 +477,7 @@ class LLMClient:
                 except json.JSONDecodeError:
                     logging.debug("LLM stream ignored non-json payload=%r", payload)
                     continue
+                self.log_usage(data.get("usage"), label="LLM stream")
                 for choice in data.get("choices", []):
                     delta = choice.get("delta") or {}
                     message = choice.get("message") or {}
@@ -510,6 +605,18 @@ class LLMClient:
             + text
             + "\n这些内容是用户已经选择并上屏的候选词，不是当前拼音；请只把它作为语境参考，保持当前拼音仍按用户输入转换。"
         )
+
+    def format_recent_committed_turns(self, turns):
+        result = []
+        for turn in turns or []:
+            if not isinstance(turn, dict):
+                continue
+            pinyin = " ".join(str(turn.get("pinyin") or "").split())
+            text = " ".join(str(turn.get("text") or "").split())
+            if not pinyin or not text:
+                continue
+            result.append({"pinyin": pinyin, "text": text})
+        return result
 
     def parse_candidates(self, content, max_candidates=5):
         text = content.strip()

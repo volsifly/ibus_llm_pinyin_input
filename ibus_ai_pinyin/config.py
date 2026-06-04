@@ -24,11 +24,19 @@ DEFAULT_CONFIG = {
             "enabled": None,
             "type": "disabled",
         },
+        "cache_optimization": {
+            "enabled": "auto",
+            "provider": "",
+            "log_usage": True,
+        },
         "extra_body": {},
     },
     "input": {
         "max_buffer_length": 120,
         "candidate_page_size": 5,
+        "recent_context_items": 30,
+        "recent_context_chars": 0,
+        "recent_context_idle_timeout_seconds": 1800,
         "default_mode": "zh",
         "toggle_key": {
             "enabled": True,

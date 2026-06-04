@@ -45,6 +45,18 @@ class CandidateCache:
         )
         return [row[0] for row in cur.fetchall()]
 
+    def has(self, pinyin, candidate):
+        cur = self.conn.execute(
+            """
+            SELECT 1
+            FROM candidates
+            WHERE pinyin = ? AND candidate = ?
+            LIMIT 1
+            """,
+            (pinyin, candidate),
+        )
+        return cur.fetchone() is not None
+
     def put_many(self, pinyin, candidates, source="llm"):
         now = int(time.time())
         for candidate in candidates:
@@ -71,3 +83,14 @@ class CandidateCache:
             (now, pinyin, candidate),
         )
         self.conn.commit()
+
+    def delete(self, pinyin, candidate):
+        cur = self.conn.execute(
+            """
+            DELETE FROM candidates
+            WHERE pinyin = ? AND candidate = ?
+            """,
+            (pinyin, candidate),
+        )
+        self.conn.commit()
+        return cur.rowcount

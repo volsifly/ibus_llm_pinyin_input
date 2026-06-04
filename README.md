@@ -96,11 +96,19 @@ ibus engine ai-pinyin
       "enabled": false,
       "type": "disabled"
     },
+    "cache_optimization": {
+      "enabled": "auto",
+      "provider": "",
+      "log_usage": true
+    },
     "extra_body": {}
   },
   "input": {
     "max_buffer_length": 120,
     "candidate_page_size": 5,
+    "recent_context_items": 30,
+    "recent_context_chars": 0,
+    "recent_context_idle_timeout_seconds": 1800,
     "default_mode": "zh",
     "toggle_key": {
       "enabled": true,
@@ -133,6 +141,11 @@ ibus engine ai-pinyin
       "enabled": false,
       "type": "disabled"
     },
+    "cache_optimization": {
+      "enabled": "auto",
+      "provider": "",
+      "log_usage": true
+    },
     "extra_body": {}
   }
 }
@@ -149,6 +162,30 @@ ibus engine ai-pinyin
 ```
 
 这适用于支持关闭思考的 OpenAI-compatible 服务。其他厂商需要额外请求字段时，可以放到 `api.extra_body`。
+
+`deepseek-v4-flash` / `deepseek-v4-pro` 使用 DeepSeek 服务端自动上下文缓存。`api.cache_optimization.enabled=auto` 时，客户端会在检测到 DeepSeek base URL 或模型名后自动启用缓存友好的请求顺序：稳定 system prompt 保持不变，历史输入作为当前请求前面的 chat messages，当前拼音始终放在最后一条 user message，尽量让 DeepSeek 复用请求前缀。流式请求会自动加入：
+
+```json
+{
+  "stream_options": {
+    "include_usage": true
+  }
+}
+```
+
+日志会记录 DeepSeek 返回的 `prompt_cache_hit_tokens` 和 `prompt_cache_miss_tokens`，用于确认缓存是否命中。如果通过转发服务调用 DeepSeek 且 URL/模型名里不含 `deepseek`，可以显式设置：
+
+```json
+{
+  "api": {
+    "cache_optimization": {
+      "enabled": true,
+      "provider": "deepseek",
+      "log_usage": true
+    }
+  }
+}
+```
 
 如果服务不支持 `thinking` 请求字段，把 `thinking.enabled` 设为 `null`，客户端就不会发送该字段。NVIDIA NIM 的部分推理模型需要在 system prompt 开头加入 `/no_think` 来关闭扩展思考，例如：
 
@@ -254,6 +291,7 @@ llama-server \
 按 - 或 = 排除当前候选并生成下一组候选
 按 1-9 选择候选
 按 Ctrl+1 到 Ctrl+9 修改对应候选
+选中带 * 的缓存候选后按 Delete 删除该缓存
 按空格提交当前第一个候选
 按回车提交当前候选或原始拼音
 按 Esc 清空
@@ -267,6 +305,24 @@ llama-server \
 候选列表显示时，按 `-` 或 `=` 会模拟翻页：输入法把当前候选作为排除列表发给 LLM，请求生成一组新的候选。如果模型没有返回新候选，会继续保留当前候选列表。
 
 如果已经开始输入拼音，继续输入 ASCII 标点或符号不会退出输入法缓冲区。例如输入 `nihao,` 后按空格，发送给 LLM 的内容就是 `nihao,`。如果当前没有拼音缓冲区，符号仍然直接交给当前应用。
+
+### 历史输入上下文
+
+用户每次选择候选并上屏后，输入法会在内存中记录一条历史轮次：`user` 是当时输入的拼音，`assistant` 是用户最终选择的中文结果。未选中的其他候选不会写入历史上下文。
+
+下一次调用 LLM 时，这些历史轮次会作为当前请求前面的 chat messages 发送，例如：
+
+```json
+[
+  {"role": "user", "content": "拼音：hongling\n请输出中文候选 JSON 数组。"},
+  {"role": "assistant", "content": "[\"鸿灵\"]"},
+  {"role": "user", "content": "拼音：zhishiku\n请输出中文候选 JSON 数组。"},
+  {"role": "assistant", "content": "[\"知识库\"]"},
+  {"role": "user", "content": "拼音：jixu\n请输出中文候选 JSON 数组。"}
+]
+```
+
+历史轮次只保存在当前 engine 进程内，重启输入法后会清空。默认最多保留最近 `input.recent_context_items=30` 轮，`input.recent_context_chars=0` 表示不按字符数截断。如果超过 `input.recent_context_idle_timeout_seconds=1800` 秒没有输入，下一次输入时会先清空历史轮次。
 
 数字键按输入状态区分处理：没有拼音缓冲区时直接输入数字；已经开始输入拼音后，数字会进入缓冲区；候选列表显示时，`1-9` 继续用于选择候选。
 
@@ -430,6 +486,8 @@ SQLite 历史缓存
 ```
 
 词库本身不直接输出候选。当长输入命中领域词上下文时，缓存不会直接截断请求，输入法仍会调用 LLM 补充结果；缓存只作为后备候选参与融合，避免旧缓存污染覆盖新的词库纠错结果。
+
+SQLite 历史缓存只记录用户实际选择并上屏的候选，不会把 LLM 每次输出的整组候选全部写入缓存。来自 SQLite 历史缓存的候选会在候选窗中显示 `*` 标识。候选窗显示时，选中某个缓存候选后按 `Delete` 可以从 SQLite 缓存中删除该候选；这只删除历史候选缓存，不会删除领域词库、本地兜底词或用户动态词库条目。
 
 ## 日志和缓存
 

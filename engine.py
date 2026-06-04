@@ -2,6 +2,7 @@
 import logging
 import os
 import threading
+import time
 
 import gi
 
@@ -108,14 +109,17 @@ class AIPinyinEngine(IBus.Engine):
         self.edit_candidates_snapshot = []
         self.edit_replacement_buffer = ""
         self.edit_replacement_candidates = []
-        self.recent_committed_candidates = []
+        self.recent_committed_turns = []
+        self.last_input_activity_at = 0
         self.candidate_pages = []
         self.candidate_page_index = 0
         self.candidate_pages_pinyin = ""
+        self.cached_candidate_labels = set()
 
     def do_process_key_event(self, keyval, keycode, state):
         if state & IBus.ModifierType.RELEASE_MASK:
             return False
+        self.note_input_activity()
         logging.debug(
             "key event keyval=%s keycode=%s state=%s caps=%s",
             keyval,
@@ -133,6 +137,9 @@ class AIPinyinEngine(IBus.Engine):
 
         if self.edit_mode:
             return self.process_edit_key_event(keyval, state)
+
+        if self.candidates and keyval == IBus.KEY_Delete:
+            return self.delete_selected_cached_candidate()
 
         ctrl_digit_index = self.ctrl_digit_index(keyval, keycode, state)
         if self.candidates and ctrl_digit_index is not None:
@@ -568,7 +575,7 @@ class AIPinyinEngine(IBus.Engine):
         pinyin = self.edit_original_pinyin
         original = self.edit_original_candidate
         self.commit_text(IBus.Text.new_from_string(text))
-        self.record_recent_committed_candidate(text)
+        self.record_recent_committed_candidate(pinyin, text)
         if save_memory and self.memory_enabled:
             self.save_candidate_correction(pinyin, original, text)
         self.clear_all()
@@ -654,8 +661,11 @@ class AIPinyinEngine(IBus.Engine):
         cached = []
         if self.cache_enabled:
             cached = self.cache.get(pinyin, limit=max_candidates)
+            self.cached_candidate_labels = set(cached)
             if cached:
                 logging.info("candidate cache hit count=%s", len(cached))
+        else:
+            self.cached_candidate_labels = set()
 
         local_candidates = get_local_candidates(pinyin, limit=max_candidates)
         if local_candidates:
@@ -668,9 +678,9 @@ class AIPinyinEngine(IBus.Engine):
             limit=max_candidates,
         )
         llm_context = merge_context_items(user_context, dictionary_context)
-        recent_committed_text = self.get_recent_committed_context()
-        if recent_committed_text:
-            logging.info("recent committed context chars=%s", len(recent_committed_text))
+        recent_committed_turns = self.get_recent_committed_context()
+        if recent_committed_turns:
+            logging.info("recent committed context turns=%s", len(recent_committed_turns))
         if not llm_context and len(merged) >= max_candidates:
             self.show_candidates(merged)
             return
@@ -693,7 +703,7 @@ class AIPinyinEngine(IBus.Engine):
                 local_candidates,
                 llm_context,
                 user_exact_candidates,
-                recent_committed_text,
+                recent_committed_turns,
             ),
             daemon=True,
         ).start()
@@ -821,7 +831,7 @@ class AIPinyinEngine(IBus.Engine):
         local_candidates=None,
         dictionary_context=None,
         user_exact_candidates=None,
-        recent_committed_text=None,
+        recent_committed_turns=None,
     ):
         candidates = []
         try:
@@ -829,7 +839,7 @@ class AIPinyinEngine(IBus.Engine):
                 pinyin,
                 max_candidates=max_candidates,
                 dictionary_context=dictionary_context or [],
-                recent_committed_text=recent_committed_text or "",
+                recent_committed_turns=recent_committed_turns or [],
             ):
                 if candidate not in candidates:
                     candidates.append(candidate)
@@ -851,7 +861,7 @@ class AIPinyinEngine(IBus.Engine):
                     pinyin,
                     max_candidates=max_candidates,
                     dictionary_context=dictionary_context or [],
-                    recent_committed_text=recent_committed_text or "",
+                    recent_committed_turns=recent_committed_turns or [],
                 )
                 logging.info("LLM fallback candidates ready count=%s", len(candidates))
         except Exception as exc:
@@ -861,7 +871,7 @@ class AIPinyinEngine(IBus.Engine):
                     pinyin,
                     max_candidates=max_candidates,
                     dictionary_context=dictionary_context or [],
-                    recent_committed_text=recent_committed_text or "",
+                    recent_committed_turns=recent_committed_turns or [],
                 )
                 logging.info("LLM fallback candidates ready count=%s", len(candidates))
             except Exception as fallback_exc:
@@ -929,8 +939,6 @@ class AIPinyinEngine(IBus.Engine):
             return False
 
         if candidates:
-            if self.cache_enabled:
-                self.cache.put_many(pinyin, candidates)
             self.show_candidates(candidates)
             self.candidate_pages_pinyin = pinyin
             self.candidate_pages = [list(candidates)]
@@ -994,11 +1002,56 @@ class AIPinyinEngine(IBus.Engine):
             round=True,
         )
         for candidate in candidates:
-            table.append_candidate(IBus.Text.new_from_string(candidate))
+            table.append_candidate(IBus.Text.new_from_string(self.format_candidate_label(candidate)))
 
         self.update_lookup_table(table, True)
         self.update_composition_ui()
         logging.info("lookup table shown count=%s", len(candidates))
+
+    def format_candidate_label(self, candidate):
+        if candidate in self.cached_candidate_labels:
+            return f"{candidate} *"
+        return candidate
+
+    def delete_selected_cached_candidate(self):
+        if not self.candidates or self.selected_index >= len(self.candidates):
+            return False
+        pinyin = " ".join(self.buffer.split())
+        candidate = self.candidates[self.selected_index]
+        if not pinyin or not self.cache_enabled:
+            return False
+        deleted = self.cache.delete(pinyin, candidate)
+        if not deleted:
+            logging.info("candidate cache delete ignored missing pinyin_chars=%s candidate_len=%s", len(pinyin), len(candidate))
+            return True
+
+        self.cached_candidate_labels.discard(candidate)
+        self.candidates = [
+            item for index, item in enumerate(self.candidates)
+            if index != self.selected_index
+        ]
+        self.candidate_pages = [
+            [item for item in page if item != candidate]
+            for page in self.candidate_pages
+        ]
+        self.candidate_pages = [page for page in self.candidate_pages if page]
+        if self.candidate_page_index >= len(self.candidate_pages):
+            self.candidate_page_index = max(0, len(self.candidate_pages) - 1)
+        if self.selected_index >= len(self.candidates):
+            self.selected_index = max(0, len(self.candidates) - 1)
+
+        logging.info(
+            "candidate cache deleted pinyin_chars=%s candidate_len=%s remaining=%s",
+            len(pinyin),
+            len(candidate),
+            len(self.candidates),
+        )
+        if self.candidates:
+            self.show_candidates(self.candidates)
+        else:
+            self.hide_lookup_table()
+            self.update_composition_ui()
+        return True
 
     def ensure_candidate_page_history(self, pinyin):
         if not hasattr(self, "candidate_pages"):
@@ -1046,9 +1099,10 @@ class AIPinyinEngine(IBus.Engine):
         pinyin = " ".join(self.buffer.split())
         text = self.candidates[index]
         self.commit_text(IBus.Text.new_from_string(text))
-        self.record_recent_committed_candidate(text)
+        self.record_recent_committed_candidate(pinyin, text)
 
         if self.cache_enabled:
+            self.cache.put_many(pinyin, [text], source="user_selected")
             self.cache.promote(pinyin, text)
 
         self.clear_all()
@@ -1057,33 +1111,65 @@ class AIPinyinEngine(IBus.Engine):
         self.commit_text(IBus.Text.new_from_string(self.buffer))
         self.clear_all()
 
-    def record_recent_committed_candidate(self, text):
+    def record_recent_committed_candidate(self, pinyin, text=None):
+        if text is None:
+            text = pinyin
+            pinyin = ""
+        pinyin = " ".join(str(pinyin or "").split())
         text = " ".join(str(text or "").split())
-        if not text:
+        if not pinyin or not text:
             return
-        self.recent_committed_candidates.append(text)
-        max_items = self.config.get("input", {}).get("recent_context_items", 8)
+        self.recent_committed_turns.append({"pinyin": pinyin, "text": text})
+        max_items = self.config.get("input", {}).get("recent_context_items", 30)
         if max_items <= 0:
-            self.recent_committed_candidates = []
+            self.recent_committed_turns = []
             return
-        self.recent_committed_candidates = self.recent_committed_candidates[-max_items:]
+        self.recent_committed_turns = self.recent_committed_turns[-max_items:]
 
     def get_recent_committed_context(self):
-        max_chars = self.config.get("input", {}).get("recent_context_chars", 80)
+        max_chars = self.config.get("input", {}).get("recent_context_chars", 0)
         if max_chars <= 0:
-            return ""
+            return [
+                {
+                    "pinyin": turn.get("pinyin", ""),
+                    "text": turn.get("text", ""),
+                }
+                for turn in self.recent_committed_turns
+                if turn.get("pinyin") and turn.get("text")
+            ]
         parts = []
         total = 0
-        for text in reversed(self.recent_committed_candidates):
-            extra = len(text) + (1 if parts else 0)
+        for turn in reversed(self.recent_committed_turns):
+            pinyin = turn.get("pinyin", "")
+            text = turn.get("text", "")
+            extra = len(pinyin) + len(text)
             if parts and total + extra > max_chars:
                 break
-            if not parts and len(text) > max_chars:
-                parts.append(text[-max_chars:])
+            if not parts and extra > max_chars:
+                parts.append({"pinyin": pinyin[-max_chars:], "text": text[-max_chars:]})
                 break
-            parts.append(text)
+            parts.append({"pinyin": pinyin, "text": text})
             total += extra
-        return " ".join(reversed(parts))
+        return list(reversed(parts))
+
+    def note_input_activity(self):
+        now = time.monotonic()
+        timeout = self.config.get("input", {}).get(
+            "recent_context_idle_timeout_seconds",
+            1800,
+        )
+        if (
+            timeout > 0
+            and self.last_input_activity_at
+            and now - self.last_input_activity_at > timeout
+            and self.recent_committed_turns
+        ):
+            self.recent_committed_turns = []
+            logging.info(
+                "recent committed context cleared after idle seconds=%s",
+                int(now - self.last_input_activity_at),
+            )
+        self.last_input_activity_at = now
 
     def clear_all(self):
         self.request_id += 1
@@ -1099,6 +1185,7 @@ class AIPinyinEngine(IBus.Engine):
         self.candidates = []
         self.candidate_note_buffer = ""
         self.reset_candidate_page_history()
+        self.cached_candidate_labels = set()
         self.selected_index = 0
         self.is_requesting = False
         self.update_composition_ui()
