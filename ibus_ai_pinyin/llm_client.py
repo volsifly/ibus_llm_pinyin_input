@@ -34,7 +34,7 @@ class LLMClient:
         )
         self.user_template = prompt.get(
             "user_template",
-            "拼音：{pinyin}\n请输出中文候选 JSON 数组。",
+            "拼音：{pinyin}\n请输出中文候选 JSON 数组，必须正好 5 个字符串。",
         )
 
     def build_request_body(
@@ -103,7 +103,7 @@ class LLMClient:
     ):
         sections = [
             "任务：将当前拼音转换为最可能的中文候选。",
-            "输出要求：只输出 JSON 字符串数组，不要解释，不要 Markdown，不要代码块；最多输出 5 个候选。",
+            "输出要求：只输出 JSON 字符串数组，不要解释，不要 Markdown，不要代码块；必须正好输出 5 个候选字符串。",
         ]
         recent_text = self.format_recent_committed_text(recent_committed_text or "")
         if recent_text:
@@ -111,7 +111,7 @@ class LLMClient:
         context_text = self.format_dictionary_context(dictionary_context or [])
         if context_text:
             sections.append(context_text)
-        sections.append(f"当前拼音：{pinyin}\n请输出中文候选 JSON 数组。")
+        sections.append(f"当前拼音：{pinyin}\n请输出中文候选 JSON 数组，必须正好 5 个字符串。")
         return "\n\n".join(sections)
 
     def build_chat_body(self, user_content, stream=None):

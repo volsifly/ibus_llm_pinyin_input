@@ -106,7 +106,7 @@ ibus engine ai-pinyin
   "input": {
     "max_buffer_length": 120,
     "candidate_page_size": 5,
-    "recent_context_items": 30,
+    "recent_context_items": 10,
     "recent_context_chars": 0,
     "recent_context_idle_timeout_seconds": 1800,
     "default_mode": "zh",
@@ -203,7 +203,7 @@ ibus engine ai-pinyin
     }
   },
   "prompt": {
-    "system": "/no_think\n只输出 JSON 字符串数组，不要解释，不要 Markdown。最多输出 5 个中文候选。"
+    "system": "/no_think\n只输出 JSON 字符串数组，不要解释，不要 Markdown。必须输出 5 个中文候选。"
   }
 }
 ```
@@ -314,15 +314,15 @@ llama-server \
 
 ```json
 [
-  {"role": "user", "content": "拼音：hongling\n请输出中文候选 JSON 数组。"},
+  {"role": "user", "content": "拼音：hongling\n请输出中文候选 JSON 数组，必须正好 5 个字符串。"},
   {"role": "assistant", "content": "[\"鸿灵\"]"},
-  {"role": "user", "content": "拼音：zhishiku\n请输出中文候选 JSON 数组。"},
+  {"role": "user", "content": "拼音：zhishiku\n请输出中文候选 JSON 数组，必须正好 5 个字符串。"},
   {"role": "assistant", "content": "[\"知识库\"]"},
-  {"role": "user", "content": "拼音：jixu\n请输出中文候选 JSON 数组。"}
+  {"role": "user", "content": "拼音：jixu\n请输出中文候选 JSON 数组，必须正好 5 个字符串。"}
 ]
 ```
 
-历史轮次只保存在当前 engine 进程内，重启输入法后会清空。默认最多保留最近 `input.recent_context_items=30` 轮，`input.recent_context_chars=0` 表示不按字符数截断。如果超过 `input.recent_context_idle_timeout_seconds=1800` 秒没有输入，下一次输入时会先清空历史轮次。
+历史轮次只保存在当前 engine 进程内，重启输入法后会清空。默认最多保留最近 `input.recent_context_items=10` 轮，`input.recent_context_chars=0` 表示不按字符数截断。如果超过 `input.recent_context_idle_timeout_seconds=1800` 秒没有输入，下一次输入时会先清空历史轮次。
 
 数字键按输入状态区分处理：没有拼音缓冲区时直接输入数字；已经开始输入拼音后，数字会进入缓冲区；候选列表显示时，`1-9` 继续用于选择候选。
 
@@ -487,7 +487,9 @@ SQLite 历史缓存
 
 词库本身不直接输出候选。当长输入命中领域词上下文时，缓存不会直接截断请求，输入法仍会调用 LLM 补充结果；缓存只作为后备候选参与融合，避免旧缓存污染覆盖新的词库纠错结果。
 
-SQLite 历史缓存只记录用户实际选择并上屏的候选，不会把 LLM 每次输出的整组候选全部写入缓存。来自 SQLite 历史缓存的候选会在候选窗中显示 `*` 标识。候选窗显示时，选中某个缓存候选后按 `Delete` 可以从 SQLite 缓存中删除该候选；这只删除历史候选缓存，不会删除领域词库、本地兜底词或用户动态词库条目。
+LLM 首轮仍强制请求 5 个候选；候选窗不会把用户动态词、SQLite 历史缓存、本地兜底和 LLM 结果的融合列表截断到 5 个。融合后超过 `candidate_page_size` 时，IBus 候选窗会分页显示全部候选。
+
+SQLite 历史缓存只记录用户实际选择并上屏的候选，不会把 LLM 每次输出的整组候选全部写入缓存。来自 SQLite 历史缓存的候选会在候选窗中显示 `*` 标识；命中用户动态词库或领域词库的候选会显示 `#` 标识。如果同一个候选同时来自缓存和知识库，会同时显示两个标识。候选窗显示时，选中某个缓存候选后按 `Delete` 可以从 SQLite 缓存中删除该候选；这只删除历史候选缓存，不会删除领域词库、本地兜底词或用户动态词库条目。
 
 ## 日志和缓存
 

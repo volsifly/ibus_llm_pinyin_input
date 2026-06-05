@@ -60,12 +60,12 @@ def test_build_request_body_includes_recent_committed_text():
 
     assert body["messages"][1] == {
         "role": "user",
-        "content": "拼音：hongling\n请输出中文候选 JSON 数组。",
+        "content": "拼音：hongling\n请输出中文候选 JSON 数组，必须正好 5 个字符串。",
     }
     assert body["messages"][2] == {"role": "assistant", "content": "[\"鸿灵\"]"}
     assert body["messages"][3] == {
         "role": "user",
-        "content": "拼音：zhishiku\n请输出中文候选 JSON 数组。",
+        "content": "拼音：zhishiku\n请输出中文候选 JSON 数组，必须正好 5 个字符串。",
     }
     assert body["messages"][4] == {"role": "assistant", "content": "[\"知识库\"]"}
     assert body["messages"][-1]["role"] == "user"
@@ -93,9 +93,10 @@ def test_deepseek_request_body_uses_cache_friendly_layout():
 
     assert body["messages"][1] == {
         "role": "user",
-        "content": "拼音：jixu\n请输出中文候选 JSON 数组。",
+        "content": "拼音：jixu\n请输出中文候选 JSON 数组，必须正好 5 个字符串。",
     }
     assert body["messages"][2] == {"role": "assistant", "content": "[\"继续\"]"}
+    assert "必须正好输出 5 个候选字符串" in user_content
     assert user_content.index("输出要求") < user_content.index("领域词库命中")
     assert user_content.index("领域词库命中") < user_content.index("当前拼音：hongling")
     assert body["stream_options"] == {"include_usage": True}
@@ -120,7 +121,7 @@ def test_deepseek_cache_layout_can_be_disabled():
 
     assert body["messages"][1] == {
         "role": "user",
-        "content": "拼音：jixu\n请输出中文候选 JSON 数组。",
+        "content": "拼音：jixu\n请输出中文候选 JSON 数组，必须正好 5 个字符串。",
     }
     assert body["messages"][2] == {"role": "assistant", "content": "[\"继续\"]"}
     assert "拼音：hongling" in user_content
@@ -159,6 +160,15 @@ def test_merge_candidates_keeps_source_order_and_dedupes():
         ["红领巾知识库检索功能"],
         limit=5,
     ) == ["鸿灵知识库搜索功能", "红领巾知识库检索功能"]
+
+
+def test_merge_candidates_allows_unlimited_display():
+    assert merge_candidates(
+        ["缓存1", "缓存2", "重复"],
+        ["重复", "本地1"],
+        ["LLM1", "LLM2", "LLM3", "LLM4", "LLM5"],
+        limit=None,
+    ) == ["缓存1", "缓存2", "重复", "本地1", "LLM1", "LLM2", "LLM3", "LLM4", "LLM5"]
 
 
 def test_dictionary_normalize_merges_duplicate_terms():
@@ -408,6 +418,26 @@ def test_more_candidates_appends_page_history_and_filters_all_previous():
     assert shown == [["你好啊"]]
 
 
+def test_candidate_delta_displays_all_merged_sources():
+    engine = AIPinyinEngine.__new__(AIPinyinEngine)
+    engine.buffer = "nihao"
+    engine.request_id = 8
+    shown = []
+    engine.show_candidates = lambda candidates: shown.append(list(candidates))
+
+    assert engine.on_candidates_delta(
+        8,
+        "nihao",
+        ["LLM1", "LLM2", "LLM3", "LLM4", "LLM5"],
+        ["缓存1", "缓存2"],
+        ["本地1"],
+        [],
+        5,
+    ) is False
+
+    assert shown == [["缓存1", "缓存2", "本地1", "LLM1", "LLM2", "LLM3", "LLM4", "LLM5"]]
+
+
 def test_previous_candidate_page_reads_history_without_request():
     engine = AIPinyinEngine.__new__(AIPinyinEngine)
     engine.buffer = "nihao"
@@ -444,6 +474,7 @@ def test_cached_candidate_label_and_delete_selected():
     engine.cache_enabled = True
     engine.cache = FakeCache()
     engine.cached_candidate_labels = {"你好", "你号"}
+    engine.knowledge_candidate_labels = {"拟好", "你好"}
     engine.candidate_pages = [["你好", "你号", "拟好"]]
     engine.candidate_page_index = 0
     shown = []
@@ -452,8 +483,9 @@ def test_cached_candidate_label_and_delete_selected():
     engine.hide_lookup_table = lambda: hidden.append(True)
     engine.update_composition_ui = lambda suffix="": None
 
-    assert engine.format_candidate_label("你好") == "你好 *"
-    assert engine.format_candidate_label("拟好") == "拟好"
+    assert engine.format_candidate_label("你好") == "你好 * #"
+    assert engine.format_candidate_label("拟好") == "拟好 #"
+    assert engine.format_candidate_label("其他") == "其他"
     assert engine.delete_selected_cached_candidate() is True
 
     assert engine.cache.deleted == [("nihao", "你号")]
@@ -541,21 +573,21 @@ def test_recent_committed_context_respects_limits():
     assert engine.get_recent_committed_context() == [{"pinyin": "jixu", "text": "继续"}]
 
 
-def test_recent_committed_context_defaults_to_30_turns_without_char_limit():
+def test_recent_committed_context_defaults_to_10_turns_without_char_limit():
     engine = AIPinyinEngine.__new__(AIPinyinEngine)
-    engine.config = {"input": {"recent_context_items": 30, "recent_context_chars": 0}}
+    engine.config = {"input": {"recent_context_items": 10, "recent_context_chars": 0}}
     engine.recent_committed_turns = []
 
-    for index in range(35):
+    for index in range(15):
         engine.record_recent_committed_candidate(
             f"pinyin{index}",
             f"很长的中文选择结果{index}",
         )
 
     context = engine.get_recent_committed_context()
-    assert len(context) == 30
+    assert len(context) == 10
     assert context[0] == {"pinyin": "pinyin5", "text": "很长的中文选择结果5"}
-    assert context[-1] == {"pinyin": "pinyin34", "text": "很长的中文选择结果34"}
+    assert context[-1] == {"pinyin": "pinyin14", "text": "很长的中文选择结果14"}
 
 
 def test_recent_committed_context_clears_after_idle_timeout():
@@ -610,6 +642,7 @@ if __name__ == "__main__":
     test_cache_promote()
     test_local_candidates()
     test_merge_candidates_keeps_source_order_and_dedupes()
+    test_merge_candidates_allows_unlimited_display()
     test_dictionary_normalize_merges_duplicate_terms()
     test_dictionary_store_import_and_query()
     test_user_memory_learns_and_queries_corrections()
@@ -626,12 +659,13 @@ if __name__ == "__main__":
     test_more_candidates_excludes_current_page()
     test_more_candidates_keeps_current_page_when_empty()
     test_more_candidates_appends_page_history_and_filters_all_previous()
+    test_candidate_delta_displays_all_merged_sources()
     test_previous_candidate_page_reads_history_without_request()
     test_cached_candidate_label_and_delete_selected()
     test_cache_writes_only_after_user_selection()
     test_recent_committed_context_records_candidates_only()
     test_recent_committed_context_respects_limits()
-    test_recent_committed_context_defaults_to_30_turns_without_char_limit()
+    test_recent_committed_context_defaults_to_10_turns_without_char_limit()
     test_recent_committed_context_clears_after_idle_timeout()
     test_candidate_page_char_shortcut_detects_plus_minus()
     test_candidate_page_key_accepts_shift_equal()

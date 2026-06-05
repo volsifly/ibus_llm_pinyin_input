@@ -34,7 +34,7 @@ DEFAULT_CONFIG = {
     "input": {
         "max_buffer_length": 120,
         "candidate_page_size": 5,
-        "recent_context_items": 30,
+        "recent_context_items": 10,
         "recent_context_chars": 0,
         "recent_context_idle_timeout_seconds": 1800,
         "default_mode": "zh",
@@ -81,9 +81,9 @@ DEFAULT_CONFIG = {
     "prompt": {
         "system": (
             "你是一个中文拼音输入法转换器。你的任务是把用户输入的拼音转换成最可能的中文候选。"
-            "只输出 JSON 字符串数组，不要解释，不要 Markdown，不要代码块。最多输出 5 个候选。"
+            "只输出 JSON 字符串数组，不要解释，不要 Markdown，不要代码块。必须输出 5 个候选。"
         ),
-        "user_template": "拼音：{pinyin}\n请输出中文候选 JSON 数组。",
+        "user_template": "拼音：{pinyin}\n请输出中文候选 JSON 数组，必须正好 5 个字符串。",
     },
 }
 

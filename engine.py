@@ -115,6 +115,7 @@ class AIPinyinEngine(IBus.Engine):
         self.candidate_page_index = 0
         self.candidate_pages_pinyin = ""
         self.cached_candidate_labels = set()
+        self.knowledge_candidate_labels = set()
 
     def do_process_key_event(self, keyval, keycode, state):
         if state & IBus.ModifierType.RELEASE_MASK:
@@ -634,12 +635,14 @@ class AIPinyinEngine(IBus.Engine):
         dictionary_context = []
         user_context = []
         user_exact_candidates = []
+        knowledge_candidate_labels = set()
         if self.memory_enabled:
             if self.memory_cfg.get("exact_match_candidate", True):
                 user_exact_candidates = self.user_memory.get_exact_candidates(
                     pinyin,
                     limit=max_candidates,
                 )
+                knowledge_candidate_labels.update(user_exact_candidates)
                 if user_exact_candidates:
                     logging.info("user memory exact candidate count=%s", len(user_exact_candidates))
             if self.memory_cfg.get("send_to_llm", True):
@@ -647,6 +650,7 @@ class AIPinyinEngine(IBus.Engine):
                     pinyin,
                     limit=self.memory_cfg.get("max_context_terms", 8),
                 )
+                knowledge_candidate_labels.update(item.get("text") for item in user_context if item.get("text"))
                 if user_context:
                     logging.info("user memory context count=%s", len(user_context))
 
@@ -655,8 +659,10 @@ class AIPinyinEngine(IBus.Engine):
                 pinyin,
                 limit=self.dictionary_max_candidates,
             )
+            knowledge_candidate_labels.update(item.get("text") for item in dictionary_context if item.get("text"))
             if dictionary_context:
                 logging.info("domain dictionary context count=%s", len(dictionary_context))
+        self.knowledge_candidate_labels = knowledge_candidate_labels
 
         cached = []
         if self.cache_enabled:
@@ -675,7 +681,7 @@ class AIPinyinEngine(IBus.Engine):
             user_exact_candidates,
             cached,
             local_candidates,
-            limit=max_candidates,
+            limit=None,
         )
         llm_context = merge_context_items(user_context, dictionary_context)
         recent_committed_turns = self.get_recent_committed_context()
@@ -887,7 +893,7 @@ class AIPinyinEngine(IBus.Engine):
                 candidates,
                 cached or [],
                 local_candidates or [],
-                limit=max_candidates,
+                limit=None,
             )
         else:
             merged = merge_candidates(
@@ -895,7 +901,7 @@ class AIPinyinEngine(IBus.Engine):
                 cached or [],
                 local_candidates or [],
                 candidates,
-                limit=max_candidates,
+                limit=None,
             )
         GLib.idle_add(self.on_candidates_ready, request_id, pinyin, merged)
 
@@ -918,14 +924,14 @@ class AIPinyinEngine(IBus.Engine):
                 candidates,
                 cached,
                 local_candidates,
-                limit=max_candidates,
+                limit=None,
             )
         else:
             merged = merge_candidates(
                 cached,
                 local_candidates,
                 candidates,
-                limit=max_candidates,
+                limit=None,
             )
         if merged:
             self.show_candidates(merged)
@@ -1009,8 +1015,13 @@ class AIPinyinEngine(IBus.Engine):
         logging.info("lookup table shown count=%s", len(candidates))
 
     def format_candidate_label(self, candidate):
-        if candidate in self.cached_candidate_labels:
-            return f"{candidate} *"
+        markers = []
+        if candidate in getattr(self, "cached_candidate_labels", set()):
+            markers.append("*")
+        if candidate in getattr(self, "knowledge_candidate_labels", set()):
+            markers.append("#")
+        if markers:
+            return f"{candidate} {' '.join(markers)}"
         return candidate
 
     def delete_selected_cached_candidate(self):
@@ -1120,7 +1131,7 @@ class AIPinyinEngine(IBus.Engine):
         if not pinyin or not text:
             return
         self.recent_committed_turns.append({"pinyin": pinyin, "text": text})
-        max_items = self.config.get("input", {}).get("recent_context_items", 30)
+        max_items = self.config.get("input", {}).get("recent_context_items", 10)
         if max_items <= 0:
             self.recent_committed_turns = []
             return
@@ -1186,6 +1197,7 @@ class AIPinyinEngine(IBus.Engine):
         self.candidate_note_buffer = ""
         self.reset_candidate_page_history()
         self.cached_candidate_labels = set()
+        self.knowledge_candidate_labels = set()
         self.selected_index = 0
         self.is_requesting = False
         self.update_composition_ui()
