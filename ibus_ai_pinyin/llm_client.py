@@ -7,6 +7,39 @@ import time
 import requests
 
 
+SYSTEM_PROMPT = (
+    "你是一个中文拼音输入法转换器。你的任务是把用户输入的拼音转换成最可能的中文候选。"
+    "输出要求：必须调用 submit_pinyin_candidates 工具函数提交 5 个中文候选词。"
+    "不要在普通文本里输出候选，不要解释，不要 Markdown，不要代码块。"
+)
+USER_TEMPLATE = "当前拼音：{pinyin}\n请调用 submit_pinyin_candidates 工具函数，提交 5 个最可能的中文候选词。"
+SUBMIT_CANDIDATES_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_pinyin_candidates",
+        "description": "提交中文拼音输入法候选词列表。",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "candidates": {
+                    "type": "array",
+                    "description": "按优先级排序的中文候选词，第一项是最可能的输入结果。",
+                    "items": {"type": "string"},
+                    "minItems": 5,
+                    "maxItems": 5,
+                }
+            },
+            "required": ["candidates"],
+        },
+    },
+}
+SUBMIT_CANDIDATES_TOOL_CHOICE = {
+    "type": "function",
+    "function": {"name": "submit_pinyin_candidates"},
+}
+
+
 class LLMClient:
     def __init__(self, config):
         api = config.get("api", {})
@@ -27,15 +60,8 @@ class LLMClient:
         api_key_env = api.get("api_key_env", "OPENAI_API_KEY")
         self.api_key = api_key or os.environ.get(api_key_env, "sk-local")
 
-        prompt = config.get("prompt", {})
-        self.system_prompt = prompt.get(
-            "system",
-            "你是一个中文拼音输入法转换器。只输出 JSON 字符串数组。",
-        )
-        self.user_template = prompt.get(
-            "user_template",
-            "拼音：{pinyin}\n请输出中文候选 JSON 数组，必须正好 5 个字符串。",
-        )
+        self.system_prompt = SYSTEM_PROMPT
+        self.user_template = USER_TEMPLATE
 
     def build_request_body(
         self,
@@ -43,6 +69,7 @@ class LLMClient:
         dictionary_context=None,
         recent_committed_text=None,
         recent_committed_turns=None,
+        surrounding_context=None,
         stream=None,
     ):
         messages = self.build_messages(
@@ -50,6 +77,7 @@ class LLMClient:
             dictionary_context=dictionary_context or [],
             recent_committed_text=recent_committed_text or "",
             recent_committed_turns=recent_committed_turns or [],
+            surrounding_context=surrounding_context or {},
         )
         return self.build_chat_body(messages, stream=stream)
 
@@ -59,16 +87,18 @@ class LLMClient:
         dictionary_context=None,
         recent_committed_text=None,
         recent_committed_turns=None,
+        surrounding_context=None,
     ):
-        messages = [{"role": "system", "content": self.system_prompt}]
-        for turn in self.format_recent_committed_turns(recent_committed_turns or []):
-            messages.append({"role": "user", "content": self.user_template.format(pinyin=turn["pinyin"])})
-            messages.append({"role": "assistant", "content": json.dumps([turn["text"]], ensure_ascii=False)})
+        system_content = self.build_system_content(
+            recent_committed_text=recent_committed_text or "",
+            recent_committed_turns=recent_committed_turns or [],
+            surrounding_context=surrounding_context or {},
+        )
+        messages = [{"role": "system", "content": system_content}]
 
         user_content = self.build_user_content(
             pinyin,
             dictionary_context=dictionary_context or [],
-            recent_committed_text=recent_committed_text or "",
         )
         messages.append({"role": "user", "content": user_content})
         return messages
@@ -78,18 +108,15 @@ class LLMClient:
         pinyin,
         dictionary_context=None,
         recent_committed_text=None,
+        surrounding_context=None,
     ):
         if self.should_use_deepseek_cache_layout():
             return self.build_deepseek_cache_user_content(
                 pinyin,
                 dictionary_context=dictionary_context or [],
-                recent_committed_text=recent_committed_text or "",
             )
 
         user_content = self.user_template.format(pinyin=pinyin)
-        recent_text = self.format_recent_committed_text(recent_committed_text or "")
-        if recent_text:
-            user_content = f"{user_content}\n\n{recent_text}"
         context_text = self.format_dictionary_context(dictionary_context or [])
         if context_text:
             user_content = f"{user_content}\n\n{context_text}"
@@ -100,26 +127,24 @@ class LLMClient:
         pinyin,
         dictionary_context=None,
         recent_committed_text=None,
+        surrounding_context=None,
     ):
         sections = [
-            "任务：将当前拼音转换为最可能的中文候选。",
-            "输出要求：只输出 JSON 字符串数组，不要解释，不要 Markdown，不要代码块；必须正好输出 5 个候选字符串。",
+            # "任务：将当前拼音转换为最可能的中文候选。",
+            # "输出要求：必须调用 submit_pinyin_candidates 工具函数提交 5 个中文候选词。",
         ]
-        recent_text = self.format_recent_committed_text(recent_committed_text or "")
-        if recent_text:
-            sections.append(recent_text)
         context_text = self.format_dictionary_context(dictionary_context or [])
         if context_text:
             sections.append(context_text)
-        sections.append(f"当前拼音：{pinyin}\n请输出中文候选 JSON 数组，必须正好 5 个字符串。")
+        sections.append(f"{pinyin}")
         return "\n\n".join(sections)
 
-    def build_chat_body(self, user_content, stream=None):
+    def build_chat_body(self, user_content, stream=None, system_content=None):
         if isinstance(user_content, list):
             messages = user_content
         else:
             messages = [
-                {"role": "system", "content": self.system_prompt},
+                {"role": "system", "content": system_content or self.system_prompt},
                 {"role": "user", "content": user_content},
             ]
         body = {
@@ -128,10 +153,12 @@ class LLMClient:
             "temperature": self.temperature,
             "top_p": self.top_p,
             "max_tokens": self.max_tokens,
-            "stream": self.stream if stream is None else stream,
+            "stream": False,
         }
         if isinstance(self.extra_body, dict):
             body.update(self.extra_body)
+        body["tools"] = [SUBMIT_CANDIDATES_TOOL]
+        body["tool_choice"] = SUBMIT_CANDIDATES_TOOL_CHOICE
         if isinstance(self.thinking, dict) and self.thinking.get("enabled") is False:
             body["thinking"] = {"type": self.thinking.get("type", "disabled")}
         elif isinstance(self.thinking, dict) and self.thinking.get("enabled") is True:
@@ -143,6 +170,65 @@ class LLMClient:
             stream_options["include_usage"] = True
             body["stream_options"] = stream_options
         return body
+
+    def log_request_body(self, label, body):
+        try:
+            payload = json.dumps(body, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            payload = repr(body)
+        logging.info("%s request body=%s", label, payload)
+
+    def build_system_content(
+        self,
+        recent_committed_text=None,
+        recent_committed_turns=None,
+        surrounding_context=None,
+    ):
+        sections = [self.system_prompt]
+        history_text = self.format_history_context(
+            recent_committed_text=recent_committed_text or "",
+            recent_committed_turns=recent_committed_turns or [],
+        )
+        if history_text:
+            sections.append(history_text)
+        surrounding_text = self.format_surrounding_context(surrounding_context or {})
+        if surrounding_text:
+            sections.append(surrounding_text)
+        return "\n\n".join(sections)
+
+    def format_history_context(self, recent_committed_text=None, recent_committed_turns=None):
+        sections = []
+        recent_text = self.format_recent_committed_text(recent_committed_text or "")
+        if recent_text:
+            sections.append(recent_text)
+
+        turns = self.format_recent_committed_turns(recent_committed_turns or [])
+        if turns:
+            text = "".join(turn["text"] for turn in turns)
+            parts = "，".join(turn["text"] for turn in turns)
+            sections.append(
+                f"历史输入：\"{text}\"\n"
+                "这些内容是用户已经选择并上屏的历史输入，不是当前拼音；请只把它作为语境参考。"
+            )
+        return "\n\n".join(sections)
+
+    def format_surrounding_context(self, surrounding_context):
+        if not isinstance(surrounding_context, dict):
+            return ""
+        before = self.normalize_context_text(surrounding_context.get("before", ""))
+        after = self.normalize_context_text(surrounding_context.get("after", ""))
+        if not before and not after:
+            return ""
+        lines = ["当前输入框上下文："]
+        if before:
+            lines.append(f"光标前文本：{before}")
+        if after:
+            lines.append(f"光标后文本：{after}")
+        lines.append("请结合这些上下文判断当前拼音最可能对应的中文，但不要输出上下文本身。")
+        return "\n".join(lines)
+
+    def normalize_context_text(self, text):
+        return " ".join(str(text or "").split())
 
     def should_use_deepseek_cache_layout(self):
         if not self.is_deepseek_request():
@@ -196,13 +282,16 @@ class LLMClient:
         dictionary_context=None,
         recent_committed_text=None,
         recent_committed_turns=None,
+        surrounding_context=None,
     ):
         body = self.build_request_body(
             pinyin,
             dictionary_context=dictionary_context or [],
             recent_committed_text=recent_committed_text or "",
             recent_committed_turns=recent_committed_turns or [],
+            surrounding_context=surrounding_context or {},
         )
+        self.log_request_body("LLM", body)
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -256,7 +345,9 @@ class LLMClient:
             content = message.get("reasoning_content") or ""
             logging.info("LLM content empty, using reasoning_content fallback")
         logging.info("LLM raw output elapsed_ms=%s content=%r", elapsed_ms, content)
-        candidates = self.parse_candidates(content, max_candidates=max_candidates)
+        candidates = self.extract_message_candidates(message, max_candidates=max_candidates)
+        if not candidates:
+            candidates = self.parse_candidates(content, max_candidates=max_candidates)
         candidates = self.rank_candidates_by_context(
             candidates, dictionary_context or []
         )
@@ -266,21 +357,36 @@ class LLMClient:
         return candidates
 
     def refine_candidates(
-        self, pinyin, current_candidates, instruction, max_candidates=5
+        self, pinyin, current_candidates, instruction, max_candidates=5, surrounding_context=None
     ):
         current_text = "\n".join(
             f"{index + 1}. {candidate}"
             for index, candidate in enumerate(current_candidates or [])
         )
         user_content = (
-            f"拼音：{pinyin}\n"
-            # f"当前候选：\n{current_text}\n"
-            f"用户补充说明：{instruction}\n"
-            "请结合补充说明，输出新的中文候选 JSON 数组。"
-            "优先保留正确候选，只调整不符合说明的候选，不要解释，不要 Markdown。"
+            f"拼音：{pinyin}\n\n"
+            # f"错误候选参考：\n{current_text}\n\n"
+            f"用户补充拼音提示：{instruction}\n\n"
+            "用户补充的是对输入拼音的额外描述,来给你更好了解用户想输入的每个拼音对应的文字,按照用户补充的说明输出候选词。"
+            # "用户继续输入补充拼音提示，是因为这些候选不符合预期。"
+            # "请不要简单复述或优先保留错误候选，除非它能被补充拼音提示明确支持。\n\n"
+            # "规则："
+            # "用户补充提示是连续拼音，不一定有空格，也不一定有固定格式；"
+            # "请自行识别其中的拼音片段、同音字定位、词语提示或逐字提示；"
+            # "补充提示用于说明原始拼音应该对应哪些汉字，不是要直接输出补充提示对应的完整词语；"
+            # "如果补充提示包含用于定位同音字的词语，请只提取被定位出来的目标汉字；"
+            # "请按原始拼音的音节顺序组合被定位出来的汉字，不要按补充提示自身的词序或完整词义输出；"
+            # "输出必须仍然符合原始拼音；"
+            # "最符合补充提示的候选必须放在第一位；"
+            # "必须调用 submit_pinyin_candidates 工具函数提交 5 个候选词，不要解释，不要 Markdown。"
         )
-        body = self.build_chat_body(user_content, stream=False)
+        body = self.build_chat_body(
+            user_content,
+            stream=False,
+            system_content=self.build_system_content(surrounding_context=surrounding_context or {}),
+        )
         logging.info("LLM refinement user content=%r", user_content)
+        self.log_request_body("LLM refinement", body)
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -329,7 +435,9 @@ class LLMClient:
         logging.info(
             "LLM refinement raw output elapsed_ms=%s content=%r", elapsed_ms, content
         )
-        candidates = self.parse_candidates(content, max_candidates=max_candidates)
+        candidates = self.extract_message_candidates(message, max_candidates=max_candidates)
+        if not candidates:
+            candidates = self.parse_candidates(content, max_candidates=max_candidates)
         logging.info(
             "LLM refinement parsed candidates elapsed_ms=%s candidates=%r",
             elapsed_ms,
@@ -337,19 +445,22 @@ class LLMClient:
         )
         return candidates
 
-    def get_more_candidates(self, pinyin, excluded_candidates, max_candidates=5):
+    def get_more_candidates(self, pinyin, excluded_candidates, max_candidates=5, surrounding_context=None):
         excluded_text = "\n".join(
             f"{index + 1}. {candidate}"
             for index, candidate in enumerate(excluded_candidates or [])
         )
         user_content = (
             f"拼音：{pinyin}\n"
-            f"排除这些已有候选：\n{excluded_text}\n"
-            "请生成一组新的中文候选 JSON 数组。"
-            "不要输出排除列表里已有的候选，不要解释，不要 Markdown。"
+            f"排除这些候选：\n{excluded_text}\n"
         )
-        body = self.build_chat_body(user_content, stream=False)
+        body = self.build_chat_body(
+            user_content,
+            stream=False,
+            system_content=self.build_system_content(surrounding_context=surrounding_context or {}),
+        )
         logging.info("LLM more candidates user content=%r", user_content)
+        self.log_request_body("LLM more candidates", body)
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -398,7 +509,9 @@ class LLMClient:
         logging.info(
             "LLM more candidates raw output elapsed_ms=%s content=%r", elapsed_ms, content
         )
-        candidates = self.parse_candidates(content, max_candidates=max_candidates)
+        candidates = self.extract_message_candidates(message, max_candidates=max_candidates)
+        if not candidates:
+            candidates = self.parse_candidates(content, max_candidates=max_candidates)
         excluded = set(excluded_candidates or [])
         candidates = [candidate for candidate in candidates if candidate not in excluded]
         logging.info(
@@ -415,107 +528,17 @@ class LLMClient:
         dictionary_context=None,
         recent_committed_text=None,
         recent_committed_turns=None,
+        surrounding_context=None,
     ):
-        body = self.build_request_body(
+        for candidate in self.get_candidates(
             pinyin,
+            max_candidates=max_candidates,
             dictionary_context=dictionary_context or [],
             recent_committed_text=recent_committed_text or "",
             recent_committed_turns=recent_committed_turns or [],
-            stream=True,
-        )
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-            "Connection": "close",
-        }
-
-        session = requests.Session()
-        session.trust_env = bool(self.proxy_enabled)
-        url = self.base_url + self.endpoint
-        start = time.monotonic()
-        content = ""
-        emitted = []
-        seen = set()
-        try:
-            resp = session.post(
-                url,
-                headers=headers,
-                json=body,
-                timeout=self.timeout,
-                stream=True,
-            )
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-            logging.info(
-                "LLM stream response received model=%s status=%s elapsed_ms=%s",
-                self.model,
-                resp.status_code,
-                elapsed_ms,
-            )
-            try:
-                resp.raise_for_status()
-            except requests.HTTPError:
-                logging.error(
-                    "LLM stream HTTP error model=%s status=%s response=%r",
-                    self.model,
-                    resp.status_code,
-                    resp.text[:1000],
-                )
-                raise
-
-            for raw_line in resp.iter_lines(decode_unicode=False):
-                if not raw_line:
-                    continue
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
-                if payload == "[DONE]":
-                    break
-                try:
-                    data = json.loads(payload)
-                except json.JSONDecodeError:
-                    logging.debug("LLM stream ignored non-json payload=%r", payload)
-                    continue
-                self.log_usage(data.get("usage"), label="LLM stream")
-                for choice in data.get("choices", []):
-                    delta = choice.get("delta") or {}
-                    message = choice.get("message") or {}
-                    chunk = (
-                        delta.get("content")
-                        or message.get("content")
-                        or data.get("content")
-                        or ""
-                    )
-                    if not chunk:
-                        continue
-                    content += chunk
-                    for candidate in self.extract_complete_candidates(content):
-                        if candidate in seen or not self.is_valid_candidate(candidate):
-                            continue
-                        seen.add(candidate)
-                        emitted.append(candidate)
-                        yield candidate
-                        if len(emitted) >= max_candidates:
-                            return
-        except Exception:
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-            logging.exception(
-                "LLM stream request failed model=%s elapsed_ms=%s url=%s",
-                self.model,
-                elapsed_ms,
-                url,
-            )
-            raise
-        finally:
-            session.close()
-
-        if not emitted and content:
-            for candidate in self.parse_candidates(
-                content, max_candidates=max_candidates
-            ):
-                if candidate not in seen:
-                    yield candidate
+            surrounding_context=surrounding_context or {},
+        ):
+            yield candidate
 
     def extract_complete_candidates(self, content):
         text = content.strip()
@@ -548,6 +571,29 @@ class LLMClient:
                 continue
             current.append(ch)
         return [candidate for candidate in candidates if candidate]
+
+    def extract_message_candidates(self, message, max_candidates=5):
+        if not isinstance(message, dict):
+            return []
+        for tool_call in message.get("tool_calls") or []:
+            function = tool_call.get("function") if isinstance(tool_call, dict) else None
+            if not isinstance(function, dict):
+                continue
+            if function.get("name") != "submit_pinyin_candidates":
+                continue
+            arguments = function.get("arguments") or "{}"
+            if isinstance(arguments, str):
+                try:
+                    payload = json.loads(arguments)
+                except json.JSONDecodeError:
+                    logging.warning("LLM tool call arguments invalid JSON arguments=%r", arguments)
+                    continue
+            elif isinstance(arguments, dict):
+                payload = arguments
+            else:
+                continue
+            return self.normalize_candidates(payload.get("candidates", []), max_candidates=max_candidates)
+        return []
 
     def rank_candidates_by_context(self, candidates, items):
         context_terms = []
@@ -629,10 +675,16 @@ class LLMClient:
         if start >= 0 and end > start:
             text = text[start : end + 1]
 
-        arr = json.loads(text)
+        payload = json.loads(text)
+        if isinstance(payload, dict):
+            arr = payload.get("candidates", [])
+        else:
+            arr = payload
+        return self.normalize_candidates(arr, max_candidates=max_candidates)
+
+    def normalize_candidates(self, arr, max_candidates=5):
         if not isinstance(arr, list):
             return []
-
         result = []
         seen = set()
         for item in arr:

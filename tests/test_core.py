@@ -58,18 +58,55 @@ def test_build_request_body_includes_recent_committed_text():
         ],
     )
 
-    assert body["messages"][1] == {
-        "role": "user",
-        "content": "拼音：hongling\n请输出中文候选 JSON 数组，必须正好 5 个字符串。",
-    }
-    assert body["messages"][2] == {"role": "assistant", "content": "[\"鸿灵\"]"}
-    assert body["messages"][3] == {
-        "role": "user",
-        "content": "拼音：zhishiku\n请输出中文候选 JSON 数组，必须正好 5 个字符串。",
-    }
-    assert body["messages"][4] == {"role": "assistant", "content": "[\"知识库\"]"}
+    system_content = body["messages"][0]["content"]
+    assert "历史输入" in system_content
+    assert "历史输入：\"鸿灵知识库\"" in system_content
+    assert "输入了内容是：鸿灵，知识库" in system_content
+    assert "hongling" not in system_content
+    assert "zhishiku" not in system_content
     assert body["messages"][-1]["role"] == "user"
-    assert "拼音：jixu" in body["messages"][-1]["content"]
+    assert "jixu" in body["messages"][-1]["content"]
+    assert "历史输入" not in body["messages"][-1]["content"]
+    assert body["tools"][0]["function"]["name"] == "submit_pinyin_candidates"
+    assert body["tool_choice"]["function"]["name"] == "submit_pinyin_candidates"
+    assert "response_format" not in body
+
+
+def test_build_request_body_includes_surrounding_context():
+    client = LLMClient({"api": {}, "prompt": {}})
+    body = client.build_request_body(
+        "jixu",
+        surrounding_context={
+            "before": "我们刚才讨论了这个功能，接下来需要",
+            "after": "到日志里",
+        },
+    )
+    system_content = body["messages"][0]["content"]
+    user_content = body["messages"][-1]["content"]
+
+    assert "当前输入框上下文" in system_content
+    assert "光标前文本：我们刚才讨论了这个功能，接下来需要" in system_content
+    assert "光标后文本：到日志里" in system_content
+    assert "不要输出上下文本身" in system_content
+    assert "当前输入框上下文" not in user_content
+
+
+def test_prompt_config_is_ignored():
+    client = LLMClient(
+        {
+            "api": {},
+            "prompt": {
+                "system": "不要使用这个 system",
+                "user_template": "不要使用这个 user {pinyin}",
+            },
+        }
+    )
+    body = client.build_request_body("nihao")
+
+    assert "不要使用这个" not in body["messages"][0]["content"]
+    assert "不要使用这个" not in body["messages"][-1]["content"]
+    assert "submit_pinyin_candidates" in body["messages"][0]["content"]
+    assert "submit_pinyin_candidates" in body["messages"][-1]["content"]
 
 
 def test_deepseek_request_body_uses_cache_friendly_layout():
@@ -91,15 +128,16 @@ def test_deepseek_request_body_uses_cache_friendly_layout():
     )
     user_content = body["messages"][-1]["content"]
 
-    assert body["messages"][1] == {
-        "role": "user",
-        "content": "拼音：jixu\n请输出中文候选 JSON 数组，必须正好 5 个字符串。",
-    }
-    assert body["messages"][2] == {"role": "assistant", "content": "[\"继续\"]"}
-    assert "必须正好输出 5 个候选字符串" in user_content
+    assert "历史输入" in body["messages"][0]["content"]
+    assert "历史输入：\"继续\"" in body["messages"][0]["content"]
+    assert "拼音：jixu" not in body["messages"][0]["content"]
+    assert "submit_pinyin_candidates" in user_content
     assert user_content.index("输出要求") < user_content.index("领域词库命中")
     assert user_content.index("领域词库命中") < user_content.index("当前拼音：hongling")
-    assert body["stream_options"] == {"include_usage": True}
+    assert body["tools"][0]["function"]["name"] == "submit_pinyin_candidates"
+    assert body["tool_choice"]["function"]["name"] == "submit_pinyin_candidates"
+    assert body["stream"] is False
+    assert "stream_options" not in body
 
 
 def test_deepseek_cache_layout_can_be_disabled():
@@ -119,12 +157,131 @@ def test_deepseek_cache_layout_can_be_disabled():
     )
     user_content = body["messages"][-1]["content"]
 
-    assert body["messages"][1] == {
-        "role": "user",
-        "content": "拼音：jixu\n请输出中文候选 JSON 数组，必须正好 5 个字符串。",
-    }
-    assert body["messages"][2] == {"role": "assistant", "content": "[\"继续\"]"}
-    assert "拼音：hongling" in user_content
+    assert "历史输入" in body["messages"][0]["content"]
+    assert "历史输入：\"继续\"" in body["messages"][0]["content"]
+    assert "拼音：jixu" not in body["messages"][0]["content"]
+    assert "hongling" in user_content
+
+
+def test_refine_prompt_treats_current_candidates_as_wrong_reference(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        text = '{"choices":[{"message":{"tool_calls":[]}}]}'
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "submit_pinyin_candidates",
+                                        "arguments": json.dumps({"candidates": ["天气"]}),
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+
+    class FakeSession:
+        def __init__(self):
+            self.trust_env = False
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            captured["body"] = json
+            return FakeResponse()
+
+        def close(self):
+            return None
+
+    captured = {}
+    client = LLMClient({"api": {"base_url": "http://127.0.0.1:8080/v1"}, "prompt": {}})
+    monkeypatch.setattr("ibus_ai_pinyin.llm_client.requests.Session", FakeSession)
+
+    assert client.refine_candidates(
+        "tianqi",
+        ["田七", "添起"],
+        "tiankongdetian,qixiangdeqi",
+        max_candidates=5,
+    ) == ["天气"]
+
+    user_content = captured["body"]["messages"][-1]["content"]
+    assert "原始拼音：tianqi" in user_content
+    assert "错误候选参考" in user_content
+    assert "1. 田七" in user_content
+    assert "2. 添起" in user_content
+    assert "不是用户需要的输入结果" in user_content
+    assert "不要简单复述或优先保留错误候选" in user_content
+    assert "用户补充拼音提示：tiankongdetian,qixiangdeqi" in user_content
+    assert "不是要直接输出补充提示对应的完整词语" in user_content
+    assert "只提取被定位出来的目标汉字" in user_content
+    assert "按原始拼音的音节顺序组合" in user_content
+    assert captured["body"]["tools"][0]["function"]["name"] == "submit_pinyin_candidates"
+    assert captured["body"]["tool_choice"]["function"]["name"] == "submit_pinyin_candidates"
+
+
+def test_get_candidates_logs_request_body(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        text = '{"choices":[{"message":{"tool_calls":[]}}]}'
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "function": {
+                                        "name": "submit_pinyin_candidates",
+                                        "arguments": json.dumps({"candidates": ["继续"]}),
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+
+    class FakeSession:
+        def __init__(self):
+            self.trust_env = False
+
+        def post(self, url, headers=None, json=None, timeout=None):
+            captured["body"] = json
+            return FakeResponse()
+
+        def close(self):
+            return None
+
+    captured = {"logs": []}
+    client = LLMClient({"api": {"base_url": "http://127.0.0.1:8080/v1"}, "prompt": {}})
+    monkeypatch.setattr("ibus_ai_pinyin.llm_client.requests.Session", FakeSession)
+    monkeypatch.setattr(
+        "ibus_ai_pinyin.llm_client.logging.info",
+        lambda message, *args: captured["logs"].append(message % args if args else message),
+    )
+
+    assert client.get_candidates(
+        "jixu",
+        surrounding_context={"before": "前文", "after": "后文"},
+    ) == ["继续"]
+
+    assert "当前输入框上下文" in captured["body"]["messages"][0]["content"]
+    assert "当前输入框上下文" not in captured["body"]["messages"][-1]["content"]
+    assert captured["body"]["tools"][0]["function"]["name"] == "submit_pinyin_candidates"
+    assert captured["body"]["tool_choice"]["function"]["name"] == "submit_pinyin_candidates"
+    assert "response_format" not in captured["body"]
+    assert any("LLM request body=" in line and "前文" in line for line in captured["logs"])
 
 
 def test_cache_promote():
@@ -637,6 +794,8 @@ if __name__ == "__main__":
     test_parse_candidates()
     test_extract_complete_candidates_from_partial_json()
     test_build_request_body_includes_recent_committed_text()
+    test_build_request_body_includes_surrounding_context()
+    test_prompt_config_is_ignored()
     test_deepseek_request_body_uses_cache_friendly_layout()
     test_deepseek_cache_layout_can_be_disabled()
     test_cache_promote()

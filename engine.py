@@ -687,6 +687,7 @@ class AIPinyinEngine(IBus.Engine):
         recent_committed_turns = self.get_recent_committed_context()
         if recent_committed_turns:
             logging.info("recent committed context turns=%s", len(recent_committed_turns))
+        surrounding_context = self.get_input_surrounding_context()
         if not llm_context and len(merged) >= max_candidates:
             self.show_candidates(merged)
             return
@@ -710,6 +711,7 @@ class AIPinyinEngine(IBus.Engine):
                 llm_context,
                 user_exact_candidates,
                 recent_committed_turns,
+                surrounding_context,
             ),
             daemon=True,
         ).start()
@@ -746,6 +748,7 @@ class AIPinyinEngine(IBus.Engine):
         self.candidate_note_buffer = ""
         max_candidates = self.config.get("candidate", {}).get("max_candidates", 5)
         excluded_candidates = self.get_all_candidate_page_items()
+        surrounding_context = self.get_input_surrounding_context()
         logging.info(
             "more candidates request started pinyin_chars=%s pages=%s excluded=%s",
             len(pinyin),
@@ -760,7 +763,7 @@ class AIPinyinEngine(IBus.Engine):
 
         threading.Thread(
             target=self.fetch_more_candidates_worker,
-            args=(request_id, pinyin, excluded_candidates, max_candidates),
+            args=(request_id, pinyin, excluded_candidates, max_candidates, surrounding_context),
             daemon=True,
         ).start()
 
@@ -770,12 +773,14 @@ class AIPinyinEngine(IBus.Engine):
         pinyin,
         excluded_candidates,
         max_candidates,
+        surrounding_context=None,
     ):
         try:
             candidates = self.llm.get_more_candidates(
                 pinyin,
                 excluded_candidates,
                 max_candidates=max_candidates,
+                surrounding_context=surrounding_context or {},
             )
         except Exception as exc:
             logging.warning("LLM more candidates request failed: %s", exc)
@@ -789,6 +794,7 @@ class AIPinyinEngine(IBus.Engine):
             return
         max_candidates = self.config.get("candidate", {}).get("max_candidates", 5)
         current_candidates = list(self.candidates)
+        surrounding_context = self.get_input_surrounding_context()
         logging.info(
             "candidate refinement request started pinyin_chars=%s instruction_chars=%s candidates=%s",
             len(pinyin),
@@ -803,7 +809,7 @@ class AIPinyinEngine(IBus.Engine):
 
         threading.Thread(
             target=self.fetch_refined_candidates_worker,
-            args=(request_id, pinyin, instruction, current_candidates, max_candidates),
+            args=(request_id, pinyin, instruction, current_candidates, max_candidates, surrounding_context),
             daemon=True,
         ).start()
 
@@ -814,6 +820,7 @@ class AIPinyinEngine(IBus.Engine):
         instruction,
         current_candidates,
         max_candidates,
+        surrounding_context=None,
     ):
         try:
             candidates = self.llm.refine_candidates(
@@ -821,6 +828,7 @@ class AIPinyinEngine(IBus.Engine):
                 current_candidates,
                 instruction,
                 max_candidates=max_candidates,
+                surrounding_context=surrounding_context or {},
             )
         except Exception as exc:
             logging.warning("LLM refinement request failed: %s", exc)
@@ -838,6 +846,7 @@ class AIPinyinEngine(IBus.Engine):
         dictionary_context=None,
         user_exact_candidates=None,
         recent_committed_turns=None,
+        surrounding_context=None,
     ):
         candidates = []
         try:
@@ -846,6 +855,7 @@ class AIPinyinEngine(IBus.Engine):
                 max_candidates=max_candidates,
                 dictionary_context=dictionary_context or [],
                 recent_committed_turns=recent_committed_turns or [],
+                surrounding_context=surrounding_context or {},
             ):
                 if candidate not in candidates:
                     candidates.append(candidate)
@@ -868,6 +878,7 @@ class AIPinyinEngine(IBus.Engine):
                     max_candidates=max_candidates,
                     dictionary_context=dictionary_context or [],
                     recent_committed_turns=recent_committed_turns or [],
+                    surrounding_context=surrounding_context or {},
                 )
                 logging.info("LLM fallback candidates ready count=%s", len(candidates))
         except Exception as exc:
@@ -878,6 +889,7 @@ class AIPinyinEngine(IBus.Engine):
                     max_candidates=max_candidates,
                     dictionary_context=dictionary_context or [],
                     recent_committed_turns=recent_committed_turns or [],
+                    surrounding_context=surrounding_context or {},
                 )
                 logging.info("LLM fallback candidates ready count=%s", len(candidates))
             except Exception as fallback_exc:
@@ -1162,6 +1174,63 @@ class AIPinyinEngine(IBus.Engine):
             parts.append({"pinyin": pinyin, "text": text})
             total += extra
         return list(reversed(parts))
+
+    def get_input_surrounding_context(self):
+        input_cfg = self.config.get("input", {})
+        if not input_cfg.get("surrounding_context_enabled", True):
+            return {}
+
+        try:
+            result = self.get_surrounding_text()
+        except Exception as exc:
+            logging.debug("surrounding context unavailable error=%s", exc)
+            return {}
+
+        text_obj = None
+        cursor_pos = 0
+        anchor_pos = 0
+        if isinstance(result, tuple):
+            if result and isinstance(result[0], bool):
+                if not result[0] or len(result) < 4:
+                    return {}
+                text_obj, cursor_pos, anchor_pos = result[1], result[2], result[3]
+            elif len(result) >= 3:
+                text_obj, cursor_pos, anchor_pos = result[0], result[1], result[2]
+            else:
+                return {}
+        else:
+            return {}
+
+        if hasattr(text_obj, "get_text"):
+            text = text_obj.get_text()
+        else:
+            text = str(text_obj or "")
+        if not text:
+            return {}
+
+        try:
+            cursor_pos = int(cursor_pos)
+            anchor_pos = int(anchor_pos)
+        except (TypeError, ValueError):
+            cursor_pos = len(text)
+            anchor_pos = cursor_pos
+        cursor_pos = max(0, min(cursor_pos, len(text)))
+        anchor_pos = max(0, min(anchor_pos, len(text)))
+        start = min(cursor_pos, anchor_pos)
+        end = max(cursor_pos, anchor_pos)
+
+        before_limit = max(0, int(input_cfg.get("surrounding_context_before_chars", 80)))
+        after_limit = max(0, int(input_cfg.get("surrounding_context_after_chars", 40)))
+        before = text[:start][-before_limit:] if before_limit else ""
+        after = text[end: end + after_limit] if after_limit else ""
+        context = {"before": before, "after": after}
+        logging.info(
+            "surrounding context captured before_chars=%s after_chars=%s selection_chars=%s",
+            len(before),
+            len(after),
+            max(0, end - start),
+        )
+        return context
 
     def note_input_activity(self):
         now = time.monotonic()
