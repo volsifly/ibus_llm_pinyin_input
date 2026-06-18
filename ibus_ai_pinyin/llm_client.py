@@ -205,7 +205,6 @@ class LLMClient:
         turns = self.format_recent_committed_turns(recent_committed_turns or [])
         if turns:
             text = "".join(turn["text"] for turn in turns)
-            parts = "，".join(turn["text"] for turn in turns)
             sections.append(
                 f"历史输入：\"{text}\"\n"
                 "这些内容是用户已经选择并上屏的历史输入，不是当前拼音；请只把它作为语境参考。"

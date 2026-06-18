@@ -10,6 +10,8 @@
 
 - 支持 OpenAI-compatible Chat Completions API。
 - 支持本地 llama.cpp、Ollama、DeepSeek、OpenRouter 等兼容服务。
+- 通过 OpenAI-compatible Function Calling 强制模型调用 `submit_pinyin_candidates` 返回 5 个候选。
+- 会把已上屏历史文本和当前输入框光标前后文放入 system content，辅助模型判断语境。
 - 拼音输入期间不把原始拼音写入当前输入框，只在 IBus 弹出区域显示输入内容和候选。
 - 用户选择候选后才提交中文到输入框。
 - 焦点切换时自动清空原始拼音、候选和辅助文本。
@@ -109,6 +111,9 @@ ibus engine ai-pinyin
     "recent_context_items": 10,
     "recent_context_chars": 0,
     "recent_context_idle_timeout_seconds": 1800,
+    "surrounding_context_enabled": true,
+    "surrounding_context_before_chars": 80,
+    "surrounding_context_after_chars": 40,
     "default_mode": "zh",
     "toggle_key": {
       "enabled": true,
@@ -123,6 +128,16 @@ ibus engine ai-pinyin
   }
 }
 ```
+
+模型提示词和 `submit_pinyin_candidates` 工具定义固定在 `ibus_ai_pinyin/llm_client.py` 中，不读取 `config.json` 的 `prompt` 配置。修改仓库中的提示词后，需要先重新安装再重启 IBus：
+
+```bash
+./scripts/install-user.sh
+ibus restart
+ibus engine ai-pinyin
+```
+
+IBus 实际运行的是 `~/.local/share/ibus-ai-pinyin` 下的安装副本，只执行 `ibus restart` 不会自动同步仓库代码。
 
 ### DeepSeek 示例
 
@@ -163,15 +178,9 @@ ibus engine ai-pinyin
 
 这适用于支持关闭思考的 OpenAI-compatible 服务。其他厂商需要额外请求字段时，可以放到 `api.extra_body`。
 
-`deepseek-v4-flash` / `deepseek-v4-pro` 使用 DeepSeek 服务端自动上下文缓存。`api.cache_optimization.enabled=auto` 时，客户端会在检测到 DeepSeek base URL 或模型名后自动启用缓存友好的请求顺序：稳定 system prompt 保持不变，历史输入作为当前请求前面的 chat messages，当前拼音始终放在最后一条 user message，尽量让 DeepSeek 复用请求前缀。流式请求会自动加入：
+`deepseek-v4-flash` / `deepseek-v4-pro` 使用 DeepSeek 服务端自动上下文缓存。`api.cache_optimization.enabled=auto` 时，客户端会在检测到 DeepSeek base URL 或模型名后使用缓存友好的 user content 布局。历史输入和输入框上下文位于 system content，当前拼音位于最后一条 user message。
 
-```json
-{
-  "stream_options": {
-    "include_usage": true
-  }
-}
-```
+Function Calling 请求统一使用 `stream=false`，避免不同兼容服务对流式 tool call 增量格式支持不一致。配置中的 `api.stream` 当前不会开启模型流式响应。
 
 日志会记录 DeepSeek 返回的 `prompt_cache_hit_tokens` 和 `prompt_cache_miss_tokens`，用于确认缓存是否命中。如果通过转发服务调用 DeepSeek 且 URL/模型名里不含 `deepseek`，可以显式设置：
 
@@ -187,7 +196,7 @@ ibus engine ai-pinyin
 }
 ```
 
-如果服务不支持 `thinking` 请求字段，把 `thinking.enabled` 设为 `null`，客户端就不会发送该字段。NVIDIA NIM 的部分推理模型需要在 system prompt 开头加入 `/no_think` 来关闭扩展思考，例如：
+如果服务不支持 `thinking` 请求字段，把 `thinking.enabled` 设为 `null`，客户端就不会发送该字段。例如：
 
 ```json
 {
@@ -201,12 +210,11 @@ ibus engine ai-pinyin
       "enabled": null,
       "type": "disabled"
     }
-  },
-  "prompt": {
-    "system": "/no_think\n只输出 JSON 字符串数组，不要解释，不要 Markdown。必须输出 5 个中文候选。"
   }
 }
 ```
+
+提示词不能通过配置覆盖；需要直接修改 `ibus_ai_pinyin/llm_client.py` 中的 `SYSTEM_PROMPT` 和 `USER_TEMPLATE`。
 
 ### 中英文切换快捷键
 
@@ -308,21 +316,39 @@ llama-server \
 
 ### 历史输入上下文
 
-用户每次选择候选并上屏后，输入法会在内存中记录一条历史轮次：`user` 是当时输入的拼音，`assistant` 是用户最终选择的中文结果。未选中的其他候选不会写入历史上下文。
+用户每次选择候选并上屏后，输入法会在内存中记录最终选择的中文结果。未选中的候选不会写入历史上下文，历史拼音也不会发送给模型。
 
-下一次调用 LLM 时，这些历史轮次会作为当前请求前面的 chat messages 发送，例如：
+下一次调用 LLM 时，已上屏候选会按顺序拼成连续文本，并放入 system content，例如用户依次输入“输入”“了”“什么”“东西”：
 
-```json
-[
-  {"role": "user", "content": "拼音：hongling\n请输出中文候选 JSON 数组，必须正好 5 个字符串。"},
-  {"role": "assistant", "content": "[\"鸿灵\"]"},
-  {"role": "user", "content": "拼音：zhishiku\n请输出中文候选 JSON 数组，必须正好 5 个字符串。"},
-  {"role": "assistant", "content": "[\"知识库\"]"},
-  {"role": "user", "content": "拼音：jixu\n请输出中文候选 JSON 数组，必须正好 5 个字符串。"}
-]
+```text
+历史输入："输入了什么东西"
 ```
 
 历史轮次只保存在当前 engine 进程内，重启输入法后会清空。默认最多保留最近 `input.recent_context_items=10` 轮，`input.recent_context_chars=0` 表示不按字符数截断。如果超过 `input.recent_context_idle_timeout_seconds=1800` 秒没有输入，下一次输入时会先清空历史轮次。
+
+### 当前输入框上下文
+
+请求候选时，输入法会通过 IBus surrounding text API 获取当前光标前后的文本，并放入 system content：
+
+```text
+当前输入框上下文：
+光标前文本：已经输入的前文
+光标后文本：光标后面的文字
+```
+
+默认最多发送光标前 80 个字符和光标后 40 个字符，可通过 `input.surrounding_context_before_chars`、`input.surrounding_context_after_chars` 调整，或将 `input.surrounding_context_enabled` 设为 `false` 关闭。应用不支持 surrounding text、密码框或敏感输入框不提供上下文时，输入法会自动降级为空上下文。
+
+### 模型工具调用
+
+所有候选请求都会提供并强制选择 `submit_pinyin_candidates` 工具：
+
+```json
+{
+  "candidates": ["候选1", "候选2", "候选3", "候选4", "候选5"]
+}
+```
+
+客户端优先解析 `message.tool_calls[].function.arguments.candidates`。为兼容暂时不支持 Function Calling 的旧服务，也保留从普通 `content` JSON 中解析候选的兜底逻辑。
 
 数字键按输入状态区分处理：没有拼音缓冲区时直接输入数字；已经开始输入拼音后，数字会进入缓冲区；候选列表显示时，`1-9` 继续用于选择候选。
 
@@ -505,7 +531,7 @@ SQLite 历史缓存只记录用户实际选择并上屏的候选，不会把 LLM
 ~/.config/ibus-ai-pinyin/cache.sqlite3
 ```
 
-日志会记录模型请求耗时、HTTP 状态、原始输出和解析后的候选，便于排查 API 配置问题。日志可能包含模型返回内容，调试完成后可以按需清理：
+日志会记录完整 LLM request body（不含 Authorization）、模型请求耗时、HTTP 状态、原始输出和解析后的候选，便于检查 system/user content、输入框上下文和工具定义。日志可能包含当前输入框文字、历史输入及模型返回内容，调试完成后可以按需清理：
 
 ```bash
 truncate -s 0 ~/.cache/ibus-ai-pinyin/engine.log

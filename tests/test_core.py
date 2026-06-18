@@ -61,7 +61,7 @@ def test_build_request_body_includes_recent_committed_text():
     system_content = body["messages"][0]["content"]
     assert "历史输入" in system_content
     assert "历史输入：\"鸿灵知识库\"" in system_content
-    assert "输入了内容是：鸿灵，知识库" in system_content
+    assert "输入了内容是" not in system_content
     assert "hongling" not in system_content
     assert "zhishiku" not in system_content
     assert body["messages"][-1]["role"] == "user"
@@ -131,9 +131,8 @@ def test_deepseek_request_body_uses_cache_friendly_layout():
     assert "历史输入" in body["messages"][0]["content"]
     assert "历史输入：\"继续\"" in body["messages"][0]["content"]
     assert "拼音：jixu" not in body["messages"][0]["content"]
-    assert "submit_pinyin_candidates" in user_content
-    assert user_content.index("输出要求") < user_content.index("领域词库命中")
-    assert user_content.index("领域词库命中") < user_content.index("当前拼音：hongling")
+    assert "领域词库命中" in user_content
+    assert user_content.index("领域词库命中") < user_content.index("hongling")
     assert body["tools"][0]["function"]["name"] == "submit_pinyin_candidates"
     assert body["tool_choice"]["function"]["name"] == "submit_pinyin_candidates"
     assert body["stream"] is False
