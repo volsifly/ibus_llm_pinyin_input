@@ -109,6 +109,8 @@ class AIPinyinEngine(IBus.Engine):
         self.edit_candidates_snapshot = []
         self.edit_replacement_buffer = ""
         self.edit_replacement_candidates = []
+        self.edit_request_id = 0
+        self.edit_is_requesting = False
         self.recent_committed_turns = []
         self.last_input_activity_at = 0
         self.candidate_pages = []
@@ -140,11 +142,11 @@ class AIPinyinEngine(IBus.Engine):
             return self.process_edit_key_event(keyval, state)
 
         if self.candidates and keyval == IBus.KEY_Delete:
-            return self.delete_selected_cached_candidate()
+            return self.delete_selected_candidate()
 
         ctrl_digit_index = self.ctrl_digit_index(keyval, keycode, state)
         if self.candidates and ctrl_digit_index is not None:
-            index = ctrl_digit_index
+            index = self.visible_candidate_index(ctrl_digit_index)
             if index < len(self.candidates):
                 self.start_candidate_edit(index)
                 return True
@@ -189,7 +191,7 @@ class AIPinyinEngine(IBus.Engine):
             return False
 
         if self.candidates and IBus.KEY_1 <= keyval <= IBus.KEY_9:
-            index = keyval - IBus.KEY_1
+            index = self.visible_candidate_index(keyval - IBus.KEY_1)
             if index < len(self.candidates):
                 self.commit_candidate(index)
                 return True
@@ -340,6 +342,18 @@ class AIPinyinEngine(IBus.Engine):
 
     def candidate_page_direction_from_char(self, ch):
         return -1 if ch == "-" else 1
+
+    def candidate_page_size(self):
+        return max(1, self.config.get("input", {}).get("candidate_page_size", 5))
+
+    def candidate_page_start(self):
+        size = self.candidate_page_size()
+        return (self.selected_index // size) * size
+
+    def visible_candidate_index(self, local_index):
+        if local_index < 0 or local_index >= self.candidate_page_size():
+            return len(self.candidates)
+        return self.candidate_page_start() + local_index
 
     def ctrl_digit_index(self, keyval, keycode=None, state=0):
         if not state & IBus.ModifierType.CONTROL_MASK:
@@ -535,15 +549,50 @@ class AIPinyinEngine(IBus.Engine):
         pinyin = " ".join(self.edit_replacement_buffer.split())
         max_candidates = self.config.get("candidate", {}).get("max_candidates", 5)
         candidates = get_local_candidates(pinyin, limit=max_candidates)
-        if len(candidates) < max_candidates:
-            try:
-                candidates = merge_candidates(
-                    candidates,
-                    self.llm.get_candidates(pinyin, max_candidates=max_candidates),
-                    limit=max_candidates,
-                )
-            except Exception as exc:
-                logging.warning("edit replacement candidate request failed: %s", exc)
+        if candidates:
+            self.edit_replacement_candidates = candidates
+            self.show_edit_replacement_candidates(candidates)
+        if len(candidates) >= max_candidates:
+            return
+
+        self.edit_is_requesting = True
+        self.edit_request_id += 1
+        request_id = self.edit_request_id
+        threading.Thread(
+            target=self.fetch_edit_replacement_candidates_worker,
+            args=(request_id, pinyin, list(candidates), max_candidates),
+            daemon=True,
+        ).start()
+
+    def fetch_edit_replacement_candidates_worker(
+        self, request_id, pinyin, local_candidates, max_candidates
+    ):
+        try:
+            llm_candidates = self.llm.get_candidates(
+                pinyin, max_candidates=max_candidates
+            )
+        except Exception as exc:
+            logging.warning("edit replacement candidate request failed: %s", exc)
+            llm_candidates = []
+        candidates = merge_candidates(
+            local_candidates, llm_candidates, limit=max_candidates
+        )
+        GLib.idle_add(
+            self.on_edit_replacement_candidates_ready,
+            request_id,
+            pinyin,
+            candidates,
+        )
+
+    def on_edit_replacement_candidates_ready(self, request_id, pinyin, candidates):
+        current = " ".join(self.edit_replacement_buffer.split())
+        if (
+            request_id != self.edit_request_id
+            or not self.edit_mode
+            or current != pinyin
+        ):
+            return False
+        self.edit_is_requesting = False
         self.edit_replacement_candidates = candidates
         if candidates:
             self.show_edit_replacement_candidates(candidates)
@@ -551,6 +600,7 @@ class AIPinyinEngine(IBus.Engine):
             self.insert_edit_text(self.edit_replacement_buffer)
             self.edit_replacement_buffer = ""
             self.update_edit_ui()
+        return False
 
     def show_edit_replacement_candidates(self, candidates):
         table = IBus.LookupTable.new(
@@ -559,6 +609,7 @@ class AIPinyinEngine(IBus.Engine):
             cursor_visible=True,
             round=True,
         )
+        table.set_orientation(IBus.Orientation.HORIZONTAL)
         for candidate in candidates:
             table.append_candidate(IBus.Text.new_from_string(candidate))
         self.update_lookup_table(table, True)
@@ -655,10 +706,15 @@ class AIPinyinEngine(IBus.Engine):
                     logging.info("user memory context count=%s", len(user_context))
 
         if self.dictionary_enabled:
+            dictionary_candidates = self.dictionary.get_candidates(
+                pinyin,
+                limit=max_candidates,
+            )
             dictionary_context = self.dictionary.get_context_items(
                 pinyin,
                 limit=self.dictionary_max_candidates,
             )
+            knowledge_candidate_labels.update(dictionary_candidates)
             knowledge_candidate_labels.update(item.get("text") for item in dictionary_context if item.get("text"))
             if dictionary_context:
                 logging.info("domain dictionary context count=%s", len(dictionary_context))
@@ -679,8 +735,15 @@ class AIPinyinEngine(IBus.Engine):
 
         merged = merge_candidates(
             user_exact_candidates,
+            dictionary_candidates if self.dictionary_enabled else [],
             cached,
             local_candidates,
+            limit=None,
+        )
+        high_confidence_candidates = merge_candidates(
+            user_exact_candidates,
+            dictionary_candidates if self.dictionary_enabled else [],
+            cached,
             limit=None,
         )
         llm_context = merge_context_items(user_context, dictionary_context)
@@ -688,7 +751,9 @@ class AIPinyinEngine(IBus.Engine):
         if recent_committed_turns:
             logging.info("recent committed context turns=%s", len(recent_committed_turns))
         surrounding_context = self.get_input_surrounding_context()
-        if not llm_context and len(merged) >= max_candidates:
+        if len(high_confidence_candidates) >= max_candidates or (
+            not llm_context and len(merged) >= max_candidates
+        ):
             self.show_candidates(merged)
             return
 
@@ -706,7 +771,11 @@ class AIPinyinEngine(IBus.Engine):
                 request_id,
                 pinyin,
                 max_candidates,
-                cached,
+                merge_candidates(
+                    dictionary_candidates if self.dictionary_enabled else [],
+                    cached,
+                    limit=None,
+                ),
                 local_candidates,
                 llm_context,
                 user_exact_candidates,
@@ -717,8 +786,23 @@ class AIPinyinEngine(IBus.Engine):
         ).start()
 
     def request_candidate_page(self, direction):
+        page_size = self.candidate_page_size()
+        current_start = self.candidate_page_start()
         if direction < 0:
-            self.show_previous_candidate_page()
+            if current_start <= 0:
+                logging.info("candidate previous page ignored at first page")
+                return
+            self.selected_index = max(0, current_start - page_size)
+            self.candidate_note_buffer = ""
+            self.show_candidates(self.candidates)
+            return
+        next_start = current_start + page_size
+        if next_start < len(self.candidates):
+            self.selected_index = next_start
+            self.candidate_note_buffer = ""
+            self.show_candidates(self.candidates)
+            if len(self.candidates) - next_start < page_size and not self.is_requesting:
+                self.request_more_candidates()
             return
         self.request_more_candidates()
 
@@ -742,17 +826,17 @@ class AIPinyinEngine(IBus.Engine):
 
     def request_more_candidates(self):
         pinyin = " ".join(self.buffer.split())
-        if not pinyin or not self.candidates:
+        if self.is_requesting or not pinyin or not self.candidates:
             return
         self.ensure_candidate_page_history(pinyin)
         self.candidate_note_buffer = ""
         max_candidates = self.config.get("candidate", {}).get("max_candidates", 5)
-        excluded_candidates = self.get_all_candidate_page_items()
+        excluded_candidates = list(self.candidates)
         surrounding_context = self.get_input_surrounding_context()
         logging.info(
             "more candidates request started pinyin_chars=%s pages=%s excluded=%s",
             len(pinyin),
-            len(self.candidate_pages),
+            max(1, (len(self.candidates) + self.candidate_page_size() - 1) // self.candidate_page_size()),
             len(excluded_candidates),
         )
 
@@ -857,22 +941,22 @@ class AIPinyinEngine(IBus.Engine):
                 recent_committed_turns=recent_committed_turns or [],
                 surrounding_context=surrounding_context or {},
             ):
-                if candidate not in candidates:
-                    candidates.append(candidate)
-                    logging.info("LLM stream candidate ready count=%s", len(candidates))
-                    GLib.idle_add(
-                        self.on_candidates_delta,
-                        request_id,
-                        pinyin,
-                        list(candidates),
-                        cached or [],
-                        local_candidates or [],
-                        dictionary_context or [],
-                        max_candidates,
-                    )
+                if candidate in candidates:
+                    continue
+                candidates.append(candidate)
+                GLib.idle_add(
+                    self.on_candidates_delta,
+                    request_id,
+                    pinyin,
+                    list(candidates),
+                    cached or [],
+                    local_candidates or [],
+                    dictionary_context or [],
+                    max_candidates,
+                )
             logging.info("LLM candidates ready count=%s", len(candidates))
             if not candidates:
-                logging.info("LLM stream returned empty, falling back to non-stream")
+                logging.info("LLM stream returned no candidates, using non-stream fallback")
                 candidates = self.llm.get_candidates(
                     pinyin,
                     max_candidates=max_candidates,
@@ -880,21 +964,20 @@ class AIPinyinEngine(IBus.Engine):
                     recent_committed_turns=recent_committed_turns or [],
                     surrounding_context=surrounding_context or {},
                 )
-                logging.info("LLM fallback candidates ready count=%s", len(candidates))
         except Exception as exc:
-            logging.warning("LLM stream request failed, falling back to non-stream: %s", exc)
-            try:
-                candidates = self.llm.get_candidates(
-                    pinyin,
-                    max_candidates=max_candidates,
-                    dictionary_context=dictionary_context or [],
-                    recent_committed_turns=recent_committed_turns or [],
-                    surrounding_context=surrounding_context or {},
-                )
-                logging.info("LLM fallback candidates ready count=%s", len(candidates))
-            except Exception as fallback_exc:
-                logging.warning("LLM fallback request failed: %s", fallback_exc)
-                candidates = []
+            logging.warning("LLM stream request failed: %s", exc)
+            if not candidates:
+                try:
+                    candidates = self.llm.get_candidates(
+                        pinyin,
+                        max_candidates=max_candidates,
+                        dictionary_context=dictionary_context or [],
+                        recent_committed_turns=recent_committed_turns or [],
+                        surrounding_context=surrounding_context or {},
+                    )
+                except Exception as fallback_exc:
+                    logging.warning("LLM non-stream fallback failed: %s", fallback_exc)
+                    candidates = []
         if not candidates:
             candidates = get_local_candidates(pinyin, limit=max_candidates)
             if candidates:
@@ -950,11 +1033,10 @@ class AIPinyinEngine(IBus.Engine):
         return False
 
     def on_candidates_ready(self, request_id, pinyin, candidates):
-        self.is_requesting = False
-
         current = " ".join(self.buffer.split())
         if request_id != self.request_id or current != pinyin:
             return False
+        self.is_requesting = False
 
         if candidates:
             self.show_candidates(candidates)
@@ -967,36 +1049,33 @@ class AIPinyinEngine(IBus.Engine):
         return False
 
     def on_more_candidates_ready(self, request_id, pinyin, excluded_candidates, candidates):
-        self.is_requesting = False
-
         current = " ".join(self.buffer.split())
         if request_id != self.request_id or current != pinyin:
             return False
+        self.is_requesting = False
 
         self.ensure_candidate_page_history(pinyin)
         excluded = set(excluded_candidates or [])
         fresh_candidates = [candidate for candidate in candidates if candidate not in excluded]
         if fresh_candidates:
-            self.candidate_pages = self.candidate_pages[: self.candidate_page_index + 1]
-            self.candidate_pages.append(list(fresh_candidates))
-            self.candidate_page_index = len(self.candidate_pages) - 1
-            self.selected_index = 0
-            self.show_candidates(fresh_candidates)
+            existing_candidates = list(getattr(self, "candidates", []) or excluded_candidates or [])
+            old_count = len(existing_candidates)
+            self.candidates = merge_candidates(existing_candidates, fresh_candidates, limit=None)
+            self.candidate_pages = [list(self.candidates)]
+            self.candidate_page_index = 0
+            self.selected_index = old_count
+            self.show_candidates(self.candidates)
         else:
             logging.info("more candidates request returned empty")
-            if self.candidate_pages:
-                self.show_candidates(self.candidate_pages[self.candidate_page_index])
-            else:
-                self.show_candidates(excluded_candidates)
+            self.show_candidates(getattr(self, "candidates", []) or excluded_candidates)
         return False
 
     def on_refined_candidates_ready(self, request_id, pinyin, instruction, candidates):
-        self.is_requesting = False
-
         current = " ".join(self.buffer.split())
         current_instruction = " ".join(self.candidate_note_buffer.split())
         if request_id != self.request_id or current != pinyin or current_instruction != instruction:
             return False
+        self.is_requesting = False
 
         if candidates:
             self.candidate_note_buffer = ""
@@ -1019,6 +1098,7 @@ class AIPinyinEngine(IBus.Engine):
             cursor_visible=True,
             round=True,
         )
+        table.set_orientation(IBus.Orientation.HORIZONTAL)
         for candidate in candidates:
             table.append_candidate(IBus.Text.new_from_string(self.format_candidate_label(candidate)))
 
@@ -1036,19 +1116,32 @@ class AIPinyinEngine(IBus.Engine):
             return f"{candidate} {' '.join(markers)}"
         return candidate
 
-    def delete_selected_cached_candidate(self):
+    def delete_selected_candidate(self):
         if not self.candidates or self.selected_index >= len(self.candidates):
             return False
         pinyin = " ".join(self.buffer.split())
         candidate = self.candidates[self.selected_index]
-        if not pinyin or not self.cache_enabled:
+        if not pinyin:
             return False
-        deleted = self.cache.delete(pinyin, candidate)
+
+        deleted_cache = self.cache.delete(pinyin, candidate) if self.cache_enabled else 0
+        deleted_memory = (
+            self.user_memory.delete_term(candidate) if self.memory_enabled else 0
+        )
+        deleted_dictionary = (
+            self.dictionary.delete_term(candidate) if self.dictionary_enabled else 0
+        )
+        deleted = deleted_cache + deleted_memory + deleted_dictionary
         if not deleted:
-            logging.info("candidate cache delete ignored missing pinyin_chars=%s candidate_len=%s", len(pinyin), len(candidate))
+            logging.info(
+                "candidate delete ignored missing stored candidate pinyin_chars=%s candidate_len=%s",
+                len(pinyin),
+                len(candidate),
+            )
             return True
 
         self.cached_candidate_labels.discard(candidate)
+        self.knowledge_candidate_labels.discard(candidate)
         self.candidates = [
             item for index, item in enumerate(self.candidates)
             if index != self.selected_index
@@ -1064,9 +1157,12 @@ class AIPinyinEngine(IBus.Engine):
             self.selected_index = max(0, len(self.candidates) - 1)
 
         logging.info(
-            "candidate cache deleted pinyin_chars=%s candidate_len=%s remaining=%s",
+            "candidate deleted pinyin_chars=%s candidate_len=%s cache=%s memory=%s dictionary=%s remaining=%s",
             len(pinyin),
             len(candidate),
+            deleted_cache,
+            deleted_memory,
+            deleted_dictionary,
             len(self.candidates),
         )
         if self.candidates:
@@ -1075,6 +1171,10 @@ class AIPinyinEngine(IBus.Engine):
             self.hide_lookup_table()
             self.update_composition_ui()
         return True
+
+    # Kept for scripts or tests that used the old internal method name.
+    def delete_selected_cached_candidate(self):
+        return self.delete_selected_candidate()
 
     def ensure_candidate_page_history(self, pinyin):
         if not hasattr(self, "candidate_pages"):
@@ -1098,6 +1198,8 @@ class AIPinyinEngine(IBus.Engine):
         self.candidate_pages_pinyin = ""
 
     def get_all_candidate_page_items(self):
+        if self.candidates:
+            return list(dict.fromkeys(self.candidates))
         result = []
         seen = set()
         for page in self.candidate_pages:
@@ -1261,6 +1363,8 @@ class AIPinyinEngine(IBus.Engine):
         self.edit_candidates_snapshot = []
         self.edit_replacement_buffer = ""
         self.edit_replacement_candidates = []
+        self.edit_request_id += 1
+        self.edit_is_requesting = False
         self.buffer = ""
         self.candidates = []
         self.candidate_note_buffer = ""

@@ -18,7 +18,10 @@ DEFAULT_CONFIG = {
         "temperature": 0.1,
         "top_p": 0.8,
         "max_tokens": 64,
-        "stream": False,
+        "output_protocol": "csv",
+        "max_history_chars": 48,
+        "stream": True,
+        "stream_timeout_ms": 5000,
         "proxy_enabled": False,
         "thinking": {
             "enabled": None,
@@ -33,9 +36,9 @@ DEFAULT_CONFIG = {
     },
     "input": {
         "max_buffer_length": 120,
-        "candidate_page_size": 5,
-        "recent_context_items": 10,
-        "recent_context_chars": 0,
+        "candidate_page_size": 9,
+        "recent_context_items": 6,
+        "recent_context_chars": 80,
         "recent_context_idle_timeout_seconds": 1800,
         "surrounding_context_enabled": True,
         "surrounding_context_before_chars": 80,
@@ -48,7 +51,7 @@ DEFAULT_CONFIG = {
         },
     },
     "candidate": {
-        "max_candidates": 5,
+        "max_candidates": 18,
         "fallback_to_raw_pinyin": True,
     },
     "cache": {

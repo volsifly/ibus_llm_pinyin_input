@@ -7,12 +7,9 @@ import time
 import requests
 
 
-SYSTEM_PROMPT = (
-    "你是一个中文拼音输入法转换器。你的任务是把用户输入的拼音转换成最可能的中文候选。"
-    "输出要求：必须调用 submit_pinyin_candidates 工具函数提交 5 个中文候选词。"
-    "不要在普通文本里输出候选，不要解释，不要 Markdown，不要代码块。"
-)
-USER_TEMPLATE = "当前拼音：{pinyin}\n请调用 submit_pinyin_candidates 工具函数，提交 5 个最可能的中文候选词。"
+
+SYSTEM_PROMPT = "拼音转中文。输出18个按概率排序的候选，以|分隔，无解释。可保留英文、数字和符号。"
+USER_TEMPLATE = "现在输入:{pinyin}"
 SUBMIT_CANDIDATES_TOOL = {
     "type": "function",
     "function": {
@@ -50,11 +47,17 @@ class LLMClient:
         self.temperature = api.get("temperature", 0.1)
         self.top_p = api.get("top_p", 0.8)
         self.max_tokens = api.get("max_tokens", 64)
+        self.output_protocol = api.get("output_protocol", "csv")
+        self.max_history_chars = max(0, int(api.get("max_history_chars", 48)))
         self.stream = api.get("stream", False)
+        self.stream_timeout = api.get("stream_timeout_ms", 5000) / 1000
         self.proxy_enabled = api.get("proxy_enabled", False)
         self.thinking = api.get("thinking", {})
         self.extra_body = api.get("extra_body", {})
         self.cache_optimization = api.get("cache_optimization", {})
+        debug = config.get("debug", {})
+        self.log_user_input = bool(debug.get("log_user_input", False))
+        self.log_model_output = bool(debug.get("log_model_output", False))
 
         api_key = api.get("api_key", "")
         api_key_env = api.get("api_key_env", "OPENAI_API_KEY")
@@ -62,6 +65,8 @@ class LLMClient:
 
         self.system_prompt = SYSTEM_PROMPT
         self.user_template = USER_TEMPLATE
+        if self.output_protocol == "tool_call":
+            self.system_prompt = "拼音转中文。调用submit_pinyin_candidates提交候选，无解释。"
 
     def build_request_body(
         self,
@@ -117,9 +122,6 @@ class LLMClient:
             )
 
         user_content = self.user_template.format(pinyin=pinyin)
-        context_text = self.format_dictionary_context(dictionary_context or [])
-        if context_text:
-            user_content = f"{user_content}\n\n{context_text}"
         return user_content
 
     def build_deepseek_cache_user_content(
@@ -133,10 +135,7 @@ class LLMClient:
             # "任务：将当前拼音转换为最可能的中文候选。",
             # "输出要求：必须调用 submit_pinyin_candidates 工具函数提交 5 个中文候选词。",
         ]
-        context_text = self.format_dictionary_context(dictionary_context or [])
-        if context_text:
-            sections.append(context_text)
-        sections.append(f"{pinyin}")
+        sections.append(f"现在输入:{pinyin}")
         return "\n\n".join(sections)
 
     def build_chat_body(self, user_content, stream=None, system_content=None):
@@ -153,12 +152,13 @@ class LLMClient:
             "temperature": self.temperature,
             "top_p": self.top_p,
             "max_tokens": self.max_tokens,
-            "stream": False,
+            "stream": bool(self.stream if stream is None else stream),
         }
         if isinstance(self.extra_body, dict):
             body.update(self.extra_body)
-        body["tools"] = [SUBMIT_CANDIDATES_TOOL]
-        body["tool_choice"] = SUBMIT_CANDIDATES_TOOL_CHOICE
+        if self.output_protocol == "tool_call":
+            body["tools"] = [SUBMIT_CANDIDATES_TOOL]
+            body["tool_choice"] = SUBMIT_CANDIDATES_TOOL_CHOICE
         if isinstance(self.thinking, dict) and self.thinking.get("enabled") is False:
             body["thinking"] = {"type": self.thinking.get("type", "disabled")}
         elif isinstance(self.thinking, dict) and self.thinking.get("enabled") is True:
@@ -172,6 +172,8 @@ class LLMClient:
         return body
 
     def log_request_body(self, label, body):
+        if not self.log_user_input:
+            return
         try:
             payload = json.dumps(body, ensure_ascii=False, sort_keys=True)
         except TypeError:
@@ -204,11 +206,10 @@ class LLMClient:
 
         turns = self.format_recent_committed_turns(recent_committed_turns or [])
         if turns:
-            text = "".join(turn["text"] for turn in turns)
-            sections.append(
-                f"历史输入：\"{text}\"\n"
-                "这些内容是用户已经选择并上屏的历史输入，不是当前拼音；请只把它作为语境参考。"
-            )
+            text = ",".join(turn["text"] for turn in turns)
+            if self.max_history_chars:
+                text = text[-self.max_history_chars :]
+            sections.append(f"之前输入的内容:{text}")
         return "\n\n".join(sections)
 
     def format_surrounding_context(self, surrounding_context):
@@ -218,12 +219,11 @@ class LLMClient:
         after = self.normalize_context_text(surrounding_context.get("after", ""))
         if not before and not after:
             return ""
-        lines = ["当前输入框上下文："]
+        lines = []
         if before:
-            lines.append(f"光标前文本：{before}")
+            lines.append(f"B:{before}")
         if after:
-            lines.append(f"光标后文本：{after}")
-        lines.append("请结合这些上下文判断当前拼音最可能对应的中文，但不要输出上下文本身。")
+            lines.append(f"A:{after}")
         return "\n".join(lines)
 
     def normalize_context_text(self, text):
@@ -289,6 +289,7 @@ class LLMClient:
             recent_committed_text=recent_committed_text or "",
             recent_committed_turns=recent_committed_turns or [],
             surrounding_context=surrounding_context or {},
+            stream=False,
         )
         self.log_request_body("LLM", body)
         headers = {
@@ -343,16 +344,15 @@ class LLMClient:
         if not content:
             content = message.get("reasoning_content") or ""
             logging.info("LLM content empty, using reasoning_content fallback")
-        logging.info("LLM raw output elapsed_ms=%s content=%r", elapsed_ms, content)
+        if self.log_model_output:
+            logging.info("LLM raw output elapsed_ms=%s content=%r", elapsed_ms, content)
         candidates = self.extract_message_candidates(message, max_candidates=max_candidates)
         if not candidates:
             candidates = self.parse_candidates(content, max_candidates=max_candidates)
         candidates = self.rank_candidates_by_context(
             candidates, dictionary_context or []
         )
-        logging.info(
-            "LLM parsed candidates elapsed_ms=%s candidates=%r", elapsed_ms, candidates
-        )
+        logging.info("LLM parsed candidates elapsed_ms=%s count=%s", elapsed_ms, len(candidates))
         return candidates
 
     def refine_candidates(
@@ -384,7 +384,8 @@ class LLMClient:
             stream=False,
             system_content=self.build_system_content(surrounding_context=surrounding_context or {}),
         )
-        logging.info("LLM refinement user content=%r", user_content)
+        if self.log_user_input:
+            logging.info("LLM refinement user content=%r", user_content)
         self.log_request_body("LLM refinement", body)
 
         headers = {
@@ -431,16 +432,17 @@ class LLMClient:
         self.log_usage(data.get("usage"), label="LLM refinement")
         message = data["choices"][0]["message"]
         content = message.get("content") or message.get("reasoning_content") or ""
-        logging.info(
-            "LLM refinement raw output elapsed_ms=%s content=%r", elapsed_ms, content
-        )
+        if self.log_model_output:
+            logging.info(
+                "LLM refinement raw output elapsed_ms=%s content=%r", elapsed_ms, content
+            )
         candidates = self.extract_message_candidates(message, max_candidates=max_candidates)
         if not candidates:
             candidates = self.parse_candidates(content, max_candidates=max_candidates)
         logging.info(
-            "LLM refinement parsed candidates elapsed_ms=%s candidates=%r",
+            "LLM refinement parsed candidates elapsed_ms=%s count=%s",
             elapsed_ms,
-            candidates,
+            len(candidates),
         )
         return candidates
 
@@ -458,7 +460,8 @@ class LLMClient:
             stream=False,
             system_content=self.build_system_content(surrounding_context=surrounding_context or {}),
         )
-        logging.info("LLM more candidates user content=%r", user_content)
+        if self.log_user_input:
+            logging.info("LLM more candidates user content=%r", user_content)
         self.log_request_body("LLM more candidates", body)
 
         headers = {
@@ -505,18 +508,19 @@ class LLMClient:
         self.log_usage(data.get("usage"), label="LLM more candidates")
         message = data["choices"][0]["message"]
         content = message.get("content") or message.get("reasoning_content") or ""
-        logging.info(
-            "LLM more candidates raw output elapsed_ms=%s content=%r", elapsed_ms, content
-        )
+        if self.log_model_output:
+            logging.info(
+                "LLM more candidates raw output elapsed_ms=%s content=%r", elapsed_ms, content
+            )
         candidates = self.extract_message_candidates(message, max_candidates=max_candidates)
         if not candidates:
             candidates = self.parse_candidates(content, max_candidates=max_candidates)
         excluded = set(excluded_candidates or [])
         candidates = [candidate for candidate in candidates if candidate not in excluded]
         logging.info(
-            "LLM more candidates parsed elapsed_ms=%s candidates=%r",
+            "LLM more candidates parsed elapsed_ms=%s count=%s",
             elapsed_ms,
-            candidates,
+            len(candidates),
         )
         return candidates
 
@@ -529,15 +533,104 @@ class LLMClient:
         recent_committed_turns=None,
         surrounding_context=None,
     ):
-        for candidate in self.get_candidates(
+        body = self.build_request_body(
             pinyin,
-            max_candidates=max_candidates,
             dictionary_context=dictionary_context or [],
             recent_committed_text=recent_committed_text or "",
             recent_committed_turns=recent_committed_turns or [],
             surrounding_context=surrounding_context or {},
-        ):
-            yield candidate
+            stream=True,
+        )
+        self.log_request_body("LLM stream", body)
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        session = requests.Session()
+        session.trust_env = bool(self.proxy_enabled)
+        url = self.base_url + self.endpoint
+        response = None
+        buffer = ""
+        emitted = set()
+        start = time.monotonic()
+
+        def take_complete_candidates(final=False):
+            nonlocal buffer
+            pieces = re.split(r"([|\n])", buffer)
+            if final:
+                complete = pieces
+                buffer = ""
+            else:
+                last_delimiter = -1
+                for index, piece in enumerate(pieces):
+                    if piece in ("|", "\n"):
+                        last_delimiter = index
+                if last_delimiter < 0:
+                    return []
+                complete = pieces[: last_delimiter + 1]
+                buffer = "".join(pieces[last_delimiter + 1 :])
+            text = "".join(complete)
+            return self.parse_candidates(text, max_candidates=max_candidates)
+
+        try:
+            response = session.post(
+                url,
+                headers=headers,
+                json=body,
+                stream=True,
+                timeout=(self.timeout, max(self.stream_timeout, self.timeout)),
+            )
+            response.raise_for_status()
+            response.encoding = "utf-8"
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                if line.startswith(":") or line.startswith(("event:", "id:", "retry:")):
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                if not line or line == "[DONE]":
+                    if line == "[DONE]":
+                        break
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    buffer += line
+                else:
+                    self.log_usage(event.get("usage"), label="LLM stream")
+                    choices = event.get("choices") or []
+                    if not choices:
+                        continue
+                    choice = choices[0]
+                    delta = choice.get("delta") or choice.get("message") or {}
+                    buffer += delta.get("content") or delta.get("reasoning_content") or ""
+                for candidate in take_complete_candidates():
+                    if candidate in emitted:
+                        continue
+                    emitted.add(candidate)
+                    yield candidate
+                    if len(emitted) >= max_candidates:
+                        return
+
+            for candidate in take_complete_candidates(final=True):
+                if candidate in emitted:
+                    continue
+                emitted.add(candidate)
+                yield candidate
+                if len(emitted) >= max_candidates:
+                    return
+            logging.info(
+                "LLM stream completed elapsed_ms=%s count=%s",
+                int((time.monotonic() - start) * 1000),
+                len(emitted),
+            )
+        finally:
+            if response is not None:
+                response.close()
+            session.close()
 
     def extract_complete_candidates(self, content):
         text = content.strip()
@@ -585,7 +678,10 @@ class LLMClient:
                 try:
                     payload = json.loads(arguments)
                 except json.JSONDecodeError:
-                    logging.warning("LLM tool call arguments invalid JSON arguments=%r", arguments)
+                    if self.log_model_output:
+                        logging.warning("LLM tool call arguments invalid JSON arguments=%r", arguments)
+                    else:
+                        logging.warning("LLM tool call arguments invalid JSON")
                     continue
             elif isinstance(arguments, dict):
                 payload = arguments
@@ -634,22 +730,15 @@ class LLMClient:
             lines.append(f"- {detail}")
         if not lines:
             return ""
-        return (
-            "领域词库命中：\n"
-            + "\n".join(lines)
-            + "\n请优先使用这些领域词转换拼音；如果用户输入的是长拼音短语，请把这些词自然组合进完整中文候选。"
-            + "\n命中项的拼音对应输入片段时，候选中必须使用命中词文本，不要替换成同音词、近义词或常见词。"
-        )
+        return "D:" + ";".join(line[2:] for line in lines) + "\nD命中须原样使用。"
 
     def format_recent_committed_text(self, text):
         text = " ".join(str(text or "").split())
         if not text:
             return ""
-        return (
-            "最近已输入中文："
-            + text
-            + "\n这些内容是用户已经选择并上屏的候选词，不是当前拼音；请只把它作为语境参考，保持当前拼音仍按用户输入转换。"
-        )
+        if self.max_history_chars:
+            text = text[-self.max_history_chars :]
+        return "之前输入的内容:" + text
 
     def format_recent_committed_turns(self, turns):
         result = []
@@ -674,11 +763,16 @@ class LLMClient:
         if start >= 0 and end > start:
             text = text[start : end + 1]
 
-        payload = json.loads(text)
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            payload = None
         if isinstance(payload, dict):
             arr = payload.get("candidates", [])
-        else:
+        elif isinstance(payload, list):
             arr = payload
+        else:
+            arr = re.split(r"\s*[|\n]\s*", text)
         return self.normalize_candidates(arr, max_candidates=max_candidates)
 
     def normalize_candidates(self, arr, max_candidates=5):
@@ -701,6 +795,6 @@ class LLMClient:
     def is_valid_candidate(self, candidate):
         if re.search(r"[\u3400-\u9fff]", candidate):
             return True
-        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9+#._-]{0,31}", candidate):
+        if re.fullmatch(r'''[A-Za-z0-9][A-Za-z0-9 !?.,:;@#%&+*/_='"()\-]{0,63}''', candidate):
             return True
         return False

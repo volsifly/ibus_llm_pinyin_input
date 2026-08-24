@@ -147,14 +147,18 @@ class UserMemoryStore:
             SELECT term, type, weight, pinyin, compact_pinyin, short, source
             FROM user_memory_terms
             WHERE enabled = 1
+              AND LENGTH(compact_pinyin) >= 4
+              AND INSTR(?, compact_pinyin) > 0
             ORDER BY weight DESC, LENGTH(compact_pinyin) DESC, updated_at DESC
+            LIMIT ?
             """
+            ,
+            (compact_input, max(limit * 2, limit)),
         )
         result = []
         seen = set()
         for row in cur.fetchall():
-            compact_value = row["compact_pinyin"] or ""
-            if len(compact_value) < 4 or compact_value not in compact_input or row["term"] in seen:
+            if row["term"] in seen:
                 continue
             seen.add(row["term"])
             result.append(

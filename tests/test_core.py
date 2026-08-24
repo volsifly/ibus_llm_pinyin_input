@@ -1,3 +1,5 @@
+import json
+import logging
 import os
 import sys
 import tempfile
@@ -12,6 +14,7 @@ from ibus_ai_pinyin.dictionary_store import DomainDictionaryStore
 from ibus_ai_pinyin.keybindings import matches_keybinding
 from ibus_ai_pinyin.local_candidates import get_local_candidates
 from ibus_ai_pinyin.llm_client import LLMClient
+import ibus_ai_pinyin.llm_client as llm_client_module
 from ibus_ai_pinyin.user_memory import UserMemoryStore, count_han, pinyin_short
 from engine import AIPinyinEngine
 
@@ -28,6 +31,9 @@ def test_parse_candidates():
         "你号",
     ]
     assert client.parse_candidates('说明文字 ["中文候选"] 其他文字') == ["中文候选"]
+    assert client.parse_candidates("你好|您好|哈喽") == ["你好", "您好", "哈喽"]
+    assert client.parse_candidates("你好，您好|哈喽！") == ["你好，您好", "哈喽！"]
+    assert client.parse_candidates("hello, world|C++") == ["hello, world", "C++"]
     assert client.parse_candidates('["bào cuò", "报错", "bug"]') == [
         "报错",
         "bug",
@@ -48,6 +54,48 @@ def test_extract_complete_candidates_from_partial_json():
     ]
 
 
+def test_stream_candidates_emits_on_delimiter():
+    class FakeResponse:
+        encoding = None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self, decode_unicode=False):
+            assert self.encoding == "utf-8"
+            return iter(
+                [
+                    'data: {"choices":[{"delta":{"content":"你好|"}}]}',
+                    'data: {"choices":[{"delta":{"content":"您好|"}}]}',
+                    'data: {"choices":[{"delta":{"content":"你号"}}]}',
+                    "data: [DONE]",
+                ]
+            )
+
+        def close(self):
+            return None
+
+    class FakeSession:
+        def __init__(self):
+            self.trust_env = False
+
+        def post(self, url, headers=None, json=None, stream=False, timeout=None):
+            assert stream is True
+            assert json["stream"] is True
+            return FakeResponse()
+
+        def close(self):
+            return None
+
+    original_session = llm_client_module.requests.Session
+    llm_client_module.requests.Session = FakeSession
+    try:
+        client = LLMClient({"api": {}, "prompt": {}})
+        assert list(client.stream_candidates("nihao")) == ["你好", "您好", "你号"]
+    finally:
+        llm_client_module.requests.Session = original_session
+
+
 def test_build_request_body_includes_recent_committed_text():
     client = LLMClient({"api": {}, "prompt": {}})
     body = client.build_request_body(
@@ -59,16 +107,15 @@ def test_build_request_body_includes_recent_committed_text():
     )
 
     system_content = body["messages"][0]["content"]
-    assert "历史输入" in system_content
-    assert "历史输入：\"鸿灵知识库\"" in system_content
+    assert "之前输入的内容:鸿灵,知识库" in system_content
     assert "输入了内容是" not in system_content
     assert "hongling" not in system_content
     assert "zhishiku" not in system_content
     assert body["messages"][-1]["role"] == "user"
     assert "jixu" in body["messages"][-1]["content"]
-    assert "历史输入" not in body["messages"][-1]["content"]
-    assert body["tools"][0]["function"]["name"] == "submit_pinyin_candidates"
-    assert body["tool_choice"]["function"]["name"] == "submit_pinyin_candidates"
+    assert "之前输入的内容:" not in body["messages"][-1]["content"]
+    assert "tools" not in body
+    assert "tool_choice" not in body
     assert "response_format" not in body
 
 
@@ -84,11 +131,9 @@ def test_build_request_body_includes_surrounding_context():
     system_content = body["messages"][0]["content"]
     user_content = body["messages"][-1]["content"]
 
-    assert "当前输入框上下文" in system_content
-    assert "光标前文本：我们刚才讨论了这个功能，接下来需要" in system_content
-    assert "光标后文本：到日志里" in system_content
-    assert "不要输出上下文本身" in system_content
-    assert "当前输入框上下文" not in user_content
+    assert "B:我们刚才讨论了这个功能，接下来需要" in system_content
+    assert "A:到日志里" in system_content
+    assert "B:" not in user_content
 
 
 def test_prompt_config_is_ignored():
@@ -105,8 +150,8 @@ def test_prompt_config_is_ignored():
 
     assert "不要使用这个" not in body["messages"][0]["content"]
     assert "不要使用这个" not in body["messages"][-1]["content"]
-    assert "submit_pinyin_candidates" in body["messages"][0]["content"]
-    assert "submit_pinyin_candidates" in body["messages"][-1]["content"]
+    assert "以|分隔" in body["messages"][0]["content"]
+    assert body["messages"][-1]["content"] == "现在输入:nihao"
 
 
 def test_deepseek_request_body_uses_cache_friendly_layout():
@@ -128,15 +173,13 @@ def test_deepseek_request_body_uses_cache_friendly_layout():
     )
     user_content = body["messages"][-1]["content"]
 
-    assert "历史输入" in body["messages"][0]["content"]
-    assert "历史输入：\"继续\"" in body["messages"][0]["content"]
+    assert "之前输入的内容:继续" in body["messages"][0]["content"]
     assert "拼音：jixu" not in body["messages"][0]["content"]
-    assert "领域词库命中" in user_content
-    assert user_content.index("领域词库命中") < user_content.index("hongling")
-    assert body["tools"][0]["function"]["name"] == "submit_pinyin_candidates"
-    assert body["tool_choice"]["function"]["name"] == "submit_pinyin_candidates"
-    assert body["stream"] is False
-    assert "stream_options" not in body
+    assert user_content == "现在输入:hongling"
+    assert "tools" not in body
+    assert "tool_choice" not in body
+    assert body["stream"] is True
+    assert body["stream_options"]["include_usage"] is True
 
 
 def test_deepseek_cache_layout_can_be_disabled():
@@ -156,8 +199,7 @@ def test_deepseek_cache_layout_can_be_disabled():
     )
     user_content = body["messages"][-1]["content"]
 
-    assert "历史输入" in body["messages"][0]["content"]
-    assert "历史输入：\"继续\"" in body["messages"][0]["content"]
+    assert "之前输入的内容:继续" in body["messages"][0]["content"]
     assert "拼音：jixu" not in body["messages"][0]["content"]
     assert "hongling" in user_content
 
@@ -221,8 +263,8 @@ def test_refine_prompt_treats_current_candidates_as_wrong_reference(monkeypatch)
     assert "不是要直接输出补充提示对应的完整词语" in user_content
     assert "只提取被定位出来的目标汉字" in user_content
     assert "按原始拼音的音节顺序组合" in user_content
-    assert captured["body"]["tools"][0]["function"]["name"] == "submit_pinyin_candidates"
-    assert captured["body"]["tool_choice"]["function"]["name"] == "submit_pinyin_candidates"
+    assert "tools" not in captured["body"]
+    assert "tool_choice" not in captured["body"]
 
 
 def test_get_candidates_logs_request_body(monkeypatch):
@@ -275,10 +317,10 @@ def test_get_candidates_logs_request_body(monkeypatch):
         surrounding_context={"before": "前文", "after": "后文"},
     ) == ["继续"]
 
-    assert "当前输入框上下文" in captured["body"]["messages"][0]["content"]
-    assert "当前输入框上下文" not in captured["body"]["messages"][-1]["content"]
-    assert captured["body"]["tools"][0]["function"]["name"] == "submit_pinyin_candidates"
-    assert captured["body"]["tool_choice"]["function"]["name"] == "submit_pinyin_candidates"
+    assert "B:" in captured["body"]["messages"][0]["content"]
+    assert "B:" not in captured["body"]["messages"][-1]["content"]
+    assert "tools" not in captured["body"]
+    assert "tool_choice" not in captured["body"]
     assert "response_format" not in captured["body"]
     assert any("LLM request body=" in line and "前文" in line for line in captured["logs"])
 
@@ -392,6 +434,10 @@ def test_dictionary_store_import_and_query():
         assert store.get_candidates("jin yong ci", limit=5) == []
         context = store.get_context_items("honglingmcpgongjuchajian", limit=5)
         assert [item["text"] for item in context] == ["鸿灵MCP工具"]
+        assert store.delete_term("鸿灵MCP工具") == 1
+        assert store.get_candidates("honglingmcpgongju", limit=5) == []
+        assert store.get_context_items("honglingmcpgongjuchajian", limit=5) == []
+        assert store.delete_term("不存在") == 0
 
 
 def test_user_memory_learns_and_queries_corrections():
@@ -518,6 +564,28 @@ def test_refined_candidates_clear_note_and_keep_lookup():
     assert shown == [["拟好", "你好"]]
 
 
+def test_stale_candidate_result_does_not_release_active_request():
+    engine = AIPinyinEngine.__new__(AIPinyinEngine)
+    engine.buffer = "xinde"
+    engine.request_id = 9
+    engine.is_requesting = True
+
+    assert engine.on_candidates_ready(8, "jiude", ["旧的"]) is False
+    assert engine.is_requesting is True
+
+
+def test_sensitive_llm_logs_are_disabled_by_default():
+    client = LLMClient({"api": {}, "prompt": {}})
+    messages = []
+    original_info = logging.info
+    logging.info = lambda *args, **kwargs: messages.append((args, kwargs))
+    try:
+        client.log_request_body("LLM", {"messages": [{"content": "秘密输入"}]})
+    finally:
+        logging.info = original_info
+    assert messages == []
+
+
 def test_more_candidates_excludes_current_page():
     engine = AIPinyinEngine.__new__(AIPinyinEngine)
     engine.buffer = "nihao"
@@ -529,7 +597,7 @@ def test_more_candidates_excludes_current_page():
     assert engine.on_more_candidates_ready(4, "nihao", ["你好", "你号"], ["你好", "拟好"]) is False
 
     assert engine.is_requesting is False
-    assert shown == [["拟好"]]
+    assert shown == [["你好", "你号", "拟好"]]
 
 
 def test_more_candidates_keeps_current_page_when_empty():
@@ -551,7 +619,7 @@ def test_more_candidates_appends_page_history_and_filters_all_previous():
     engine.buffer = "nihao"
     engine.request_id = 6
     engine.is_requesting = True
-    engine.candidates = ["你好", "你号"]
+    engine.candidates = ["你好", "你号", "拟好"]
     engine.candidate_pages_pinyin = "nihao"
     engine.candidate_pages = [["你好", "你号"], ["拟好"]]
     engine.candidate_page_index = 1
@@ -568,10 +636,10 @@ def test_more_candidates_appends_page_history_and_filters_all_previous():
     ) is False
 
     assert engine.is_requesting is False
-    assert engine.candidate_pages == [["你好", "你号"], ["拟好"], ["你好啊"]]
-    assert engine.candidate_page_index == 2
-    assert engine.selected_index == 0
-    assert shown == [["你好啊"]]
+    assert engine.candidate_pages == [["你好", "你号", "拟好", "你好啊"]]
+    assert engine.candidate_page_index == 0
+    assert engine.selected_index == 3
+    assert shown == [["你好", "你号", "拟好", "你好啊"]]
 
 
 def test_candidate_delta_displays_all_merged_sources():
@@ -614,6 +682,42 @@ def test_previous_candidate_page_reads_history_without_request():
     assert shown == [["你好", "你号"]]
 
 
+def test_candidate_page_uses_loaded_candidates_before_requesting_more():
+    engine = AIPinyinEngine.__new__(AIPinyinEngine)
+    engine.config = {"input": {"candidate_page_size": 5}}
+    engine.candidates = [f"候选{index}" for index in range(10)]
+    engine.selected_index = 0
+    engine.candidate_note_buffer = ""
+    engine.is_requesting = False
+    shown = []
+    requested = []
+    engine.show_candidates = lambda candidates: shown.append(list(candidates))
+    engine.request_more_candidates = lambda: requested.append(True)
+
+    engine.request_candidate_page(1)
+    assert engine.selected_index == 5
+    assert requested == []
+
+    engine.request_candidate_page(1)
+    assert requested == [True]
+
+
+def test_partial_last_page_requests_more_in_background():
+    engine = AIPinyinEngine.__new__(AIPinyinEngine)
+    engine.config = {"input": {"candidate_page_size": 5}}
+    engine.candidates = [f"候选{index}" for index in range(7)]
+    engine.selected_index = 0
+    engine.candidate_note_buffer = ""
+    engine.is_requesting = False
+    engine.show_candidates = lambda candidates: None
+    requested = []
+    engine.request_more_candidates = lambda: requested.append(True)
+
+    engine.request_candidate_page(1)
+    assert engine.selected_index == 5
+    assert requested == [True]
+
+
 def test_cached_candidate_label_and_delete_selected():
     class FakeCache:
         def __init__(self):
@@ -623,12 +727,24 @@ def test_cached_candidate_label_and_delete_selected():
             self.deleted.append((pinyin, candidate))
             return 1
 
+    class FakeStore:
+        def __init__(self):
+            self.deleted = []
+
+        def delete_term(self, term):
+            self.deleted.append(term)
+            return 1
+
     engine = AIPinyinEngine.__new__(AIPinyinEngine)
     engine.buffer = "nihao"
     engine.candidates = ["你好", "你号", "拟好"]
     engine.selected_index = 1
     engine.cache_enabled = True
     engine.cache = FakeCache()
+    engine.memory_enabled = True
+    engine.user_memory = FakeStore()
+    engine.dictionary_enabled = True
+    engine.dictionary = FakeStore()
     engine.cached_candidate_labels = {"你好", "你号"}
     engine.knowledge_candidate_labels = {"拟好", "你好"}
     engine.candidate_pages = [["你好", "你号", "拟好"]]
@@ -645,9 +761,12 @@ def test_cached_candidate_label_and_delete_selected():
     assert engine.delete_selected_cached_candidate() is True
 
     assert engine.cache.deleted == [("nihao", "你号")]
+    assert engine.user_memory.deleted == ["你号"]
+    assert engine.dictionary.deleted == ["你号"]
     assert engine.candidates == ["你好", "拟好"]
     assert engine.candidate_pages == [["你好", "拟好"]]
     assert "你号" not in engine.cached_candidate_labels
+    assert "你号" not in engine.knowledge_candidate_labels
     assert shown == [["你好", "拟好"]]
     assert hidden == []
 
@@ -792,6 +911,7 @@ def test_ctrl_digit_index_accepts_number_rows_and_keypad():
 if __name__ == "__main__":
     test_parse_candidates()
     test_extract_complete_candidates_from_partial_json()
+    test_stream_candidates_emits_on_delimiter()
     test_build_request_body_includes_recent_committed_text()
     test_build_request_body_includes_surrounding_context()
     test_prompt_config_is_ignored()
@@ -814,11 +934,15 @@ if __name__ == "__main__":
     test_move_selection_wraps_candidates()
     test_candidate_note_appends_without_replacing_candidates()
     test_refined_candidates_clear_note_and_keep_lookup()
+    test_stale_candidate_result_does_not_release_active_request()
+    test_sensitive_llm_logs_are_disabled_by_default()
     test_more_candidates_excludes_current_page()
     test_more_candidates_keeps_current_page_when_empty()
     test_more_candidates_appends_page_history_and_filters_all_previous()
     test_candidate_delta_displays_all_merged_sources()
     test_previous_candidate_page_reads_history_without_request()
+    test_candidate_page_uses_loaded_candidates_before_requesting_more()
+    test_partial_last_page_requests_more_in_background()
     test_cached_candidate_label_and_delete_selected()
     test_cache_writes_only_after_user_selection()
     test_recent_committed_context_records_candidates_only()

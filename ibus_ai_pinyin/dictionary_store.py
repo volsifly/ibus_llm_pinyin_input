@@ -194,23 +194,22 @@ class DomainDictionaryStore:
             SELECT t.term, t.type, t.weight AS term_weight, p.pinyin, p.compact_pinyin, p.short
             FROM domain_terms t
             JOIN domain_term_pinyin p ON p.term_id = t.id
-            WHERE t.enabled = 1 AND p.short IS NULL
+            WHERE t.enabled = 1
+              AND p.short IS NULL
+              AND LENGTH(p.compact_pinyin) >= 4
+              AND INSTR(?, p.compact_pinyin) > 0
             ORDER BY t.weight DESC, LENGTH(p.compact_pinyin) DESC, t.updated_at DESC
+            LIMIT ?
             """
+            ,
+            (compact_input, max(limit * 4, limit)),
         )
 
         result = []
         seen = set()
         for row in cur.fetchall():
             compact_value = row["compact_pinyin"] or ""
-            if len(compact_value) < 4:
-                continue
-            matched = False
-            match_type = ""
-            if compact_value and compact_value in compact_input:
-                matched = True
-                match_type = "contains_compact"
-            if not matched or row["term"] in seen:
+            if row["term"] in seen:
                 continue
             seen.add(row["term"])
             result.append(
@@ -220,7 +219,7 @@ class DomainDictionaryStore:
                     "type": row["type"],
                     "weight": row["term_weight"],
                     "source": "domain_dictionary",
-                    "match_type": match_type,
+                    "match_type": "contains_compact",
                 }
             )
             if len(result) >= limit:
@@ -283,6 +282,27 @@ class DomainDictionaryStore:
         self.conn.execute("DELETE FROM domain_term_pinyin WHERE term_id = ?", (term_id,))
         self.conn.execute("DELETE FROM domain_term_aliases WHERE term_id = ?", (term_id,))
         self.conn.execute("DELETE FROM domain_term_tags WHERE term_id = ?", (term_id,))
+
+    def delete_term(self, term):
+        rows = self.conn.execute(
+            "SELECT id FROM domain_terms WHERE term = ?",
+            (term,),
+        ).fetchall()
+        if not rows:
+            return 0
+        try:
+            for row in rows:
+                self._delete_term_children(row["id"])
+            placeholders = ",".join("?" for _row in rows)
+            cur = self.conn.execute(
+                f"DELETE FROM domain_terms WHERE id IN ({placeholders})",
+                tuple(row["id"] for row in rows),
+            )
+            self.conn.commit()
+            return cur.rowcount
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def _insert_pinyin(self, term_id, entry, now):
         inserted = 0

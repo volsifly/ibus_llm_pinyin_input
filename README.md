@@ -1,8 +1,8 @@
-# IBus LLM Pinyin Input
+# AI Pinyin Input
 
-一个基于 IBus 的大模型拼音输入法。用户输入拼音后按空格，输入法通过 OpenAI-compatible Chat Completions 接口请求中文候选，再由用户选择候选提交到当前输入框。
+一个大模型拼音输入法项目。仓库同时提供 IBus 前端和 fcitx5 前端；两者复用同一套 Python LLM 候选、SQLite 缓存、用户记忆和领域词库。
 
-当前实现偏 MVP：IBus 负责按键捕获、候选窗、提交文本和缓存；大模型负责把拼音转换成中文候选。详细设计见 [design.md](design.md)。
+当前实现偏 MVP：输入法前端负责按键捕获、候选窗和提交文本；Python 后端负责缓存、词库上下文和 OpenAI-compatible LLM 候选生成。详细设计见 [design.md](design.md)。
 
 [更新日志](changelog.md)
 
@@ -62,6 +62,61 @@ Chinese -> AI 拼音输入法
 ```bash
 ibus engine ai-pinyin
 ```
+
+## 安装 fcitx5 LLM 输入法
+
+fcitx5 前端会调用同一份 Python 后端，因此会保留：
+
+- `~/.config/ibus-ai-pinyin/config.json`
+- `~/.config/ibus-ai-pinyin/cache.sqlite3`
+- 已导入领域词库
+- 用户选择缓存和自动学习记忆
+
+安装：
+
+```bash
+chmod +x scripts/install-fcitx5-user.sh
+./scripts/install-fcitx5-user.sh
+fcitx5 -r
+fcitx5-remote -s ai-pinyin
+```
+
+Ubuntu 24.04 的 fcitx5 5.1 会从系统 addon 目录发现 shared-library 输入法，所以安装脚本会用 `pkexec` 把以下文件复制到系统目录：
+
+```text
+/usr/lib/x86_64-linux-gnu/fcitx5/ai-pinyin.so
+/usr/share/fcitx5/addon/ai-pinyin.conf
+/usr/share/fcitx5/inputmethod/ai-pinyin.conf
+```
+
+运行时 Python 后端仍安装在用户目录：
+
+```text
+~/.local/share/ibus-ai-pinyin/fcitx5_backend.py
+~/.local/share/ibus-ai-pinyin/ibus_ai_pinyin/
+```
+
+确认当前输入法：
+
+```bash
+fcitx5-remote -n
+```
+
+返回 `ai-pinyin` 即表示 fcitx5 LLM 输入法已启用。
+
+当前 fcitx5 前端已支持主路径：拼音缓冲、空格请求 LLM 候选、数字/空格/回车提交、退格和 ESC 清空。IBus 版已有的候选修正、翻页更多候选和流式增量会继续保留在 IBus 前端，fcitx5 前端后续再补齐。
+
+## 迁移词库到 fcitx5 自带拼音
+
+如果只想把 ai-pinyin 的用户词和领域词导出给 fcitx5 自带 `pinyin` 输入法，可以运行：
+
+```bash
+chmod +x scripts/migrate-to-fcitx5.sh scripts/export-fcitx5-pinyin-dict.py
+./scripts/migrate-to-fcitx5.sh
+fcitx5 -r
+```
+
+这条路径不会启用 LLM 候选，只会生成 fcitx5/libime 额外词库。
 
 ## 配置
 
