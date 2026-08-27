@@ -6,10 +6,13 @@ import time
 
 import requests
 
+from ibus_ai_pinyin.config import DEFAULT_SYSTEM_PROMPT, DEFAULT_USER_TEMPLATE
+from ibus_ai_pinyin.stats import LLMStatsStore
 
 
-SYSTEM_PROMPT = "拼音转中文。输出18个按概率排序的候选，以|分隔，无解释。可保留英文、数字和符号。"
-USER_TEMPLATE = "现在输入:{pinyin}"
+
+SYSTEM_PROMPT = DEFAULT_SYSTEM_PROMPT
+USER_TEMPLATE = DEFAULT_USER_TEMPLATE
 SUBMIT_CANDIDATES_TOOL = {
     "type": "function",
     "function": {
@@ -55,6 +58,7 @@ class LLMClient:
         self.thinking = api.get("thinking", {})
         self.extra_body = api.get("extra_body", {})
         self.cache_optimization = api.get("cache_optimization", {})
+        self.profile_id = config.get("active_llm_profile", "default")
         debug = config.get("debug", {})
         self.log_user_input = bool(debug.get("log_user_input", False))
         self.log_model_output = bool(debug.get("log_model_output", False))
@@ -63,10 +67,34 @@ class LLMClient:
         api_key_env = api.get("api_key_env", "OPENAI_API_KEY")
         self.api_key = api_key or os.environ.get(api_key_env, "sk-local")
 
-        self.system_prompt = SYSTEM_PROMPT
-        self.user_template = USER_TEMPLATE
+        prompt = config.get("prompt", {})
+        self.system_prompt = prompt.get("system") or SYSTEM_PROMPT
+        self.user_template = prompt.get("user_template") or USER_TEMPLATE
         if self.output_protocol == "tool_call":
             self.system_prompt = "拼音转中文。调用submit_pinyin_candidates提交候选，无解释。"
+        self.stats = None
+        if config.get("stats", {}).get("enabled", bool(config.get("stats"))):
+            stats_path = config.get("stats", {}).get(
+                "path", config.get("cache", {}).get("path", "~/.config/ibus-ai-pinyin/cache.sqlite3")
+            )
+            self.stats = LLMStatsStore(stats_path)
+
+    def record_stats(self, operation, started_at, success, usage=None, candidate_count=0, error=""):
+        if self.stats is None:
+            return
+        try:
+            self.stats.record(
+                self.profile_id,
+                self.model,
+                operation,
+                success,
+                int((time.monotonic() - started_at) * 1000),
+                usage=usage,
+                candidate_count=candidate_count,
+                error=error,
+            )
+        except Exception as exc:
+            logging.warning("LLM stats record failed: %s", exc)
 
     def build_request_body(
         self,
@@ -186,12 +214,16 @@ class LLMClient:
         recent_committed_turns=None,
         surrounding_context=None,
     ):
-        sections = [self.system_prompt]
         history_text = self.format_history_context(
             recent_committed_text=recent_committed_text or "",
             recent_committed_turns=recent_committed_turns or [],
         )
-        if history_text:
+        if "{history}" in self.system_prompt:
+            sections = [self.system_prompt.replace("{history}", history_text).strip()]
+        else:
+            # 兼容升级前未包含占位符的自定义提示词。
+            sections = [self.system_prompt]
+        if history_text and "{history}" not in self.system_prompt:
             sections.append(history_text)
         surrounding_text = self.format_surrounding_context(surrounding_context or {})
         if surrounding_text:
@@ -209,7 +241,7 @@ class LLMClient:
             text = ",".join(turn["text"] for turn in turns)
             if self.max_history_chars:
                 text = text[-self.max_history_chars :]
-            sections.append(f"之前输入的内容:{text}")
+            sections.append(text)
         return "\n\n".join(sections)
 
     def format_surrounding_context(self, surrounding_context):
@@ -334,6 +366,7 @@ class LLMClient:
                 elapsed_ms,
                 url,
             )
+            self.record_stats("candidates", start, False, error="request_failed")
             raise
         finally:
             session.close()
@@ -351,6 +384,9 @@ class LLMClient:
             candidates = self.parse_candidates(content, max_candidates=max_candidates)
         candidates = self.rank_candidates_by_context(
             candidates, dictionary_context or []
+        )
+        self.record_stats(
+            "candidates", start, True, usage=data.get("usage"), candidate_count=len(candidates)
         )
         logging.info("LLM parsed candidates elapsed_ms=%s count=%s", elapsed_ms, len(candidates))
         return candidates
@@ -424,6 +460,7 @@ class LLMClient:
                 elapsed_ms,
                 url,
             )
+            self.record_stats("refine", start, False, error="request_failed")
             raise
         finally:
             session.close()
@@ -443,6 +480,9 @@ class LLMClient:
             "LLM refinement parsed candidates elapsed_ms=%s count=%s",
             elapsed_ms,
             len(candidates),
+        )
+        self.record_stats(
+            "refine", start, True, usage=data.get("usage"), candidate_count=len(candidates)
         )
         return candidates
 
@@ -500,6 +540,7 @@ class LLMClient:
                 elapsed_ms,
                 url,
             )
+            self.record_stats("more", start, False, error="request_failed")
             raise
         finally:
             session.close()
@@ -521,6 +562,9 @@ class LLMClient:
             "LLM more candidates parsed elapsed_ms=%s count=%s",
             elapsed_ms,
             len(candidates),
+        )
+        self.record_stats(
+            "more", start, True, usage=data.get("usage"), candidate_count=len(candidates)
         )
         return candidates
 
@@ -553,6 +597,8 @@ class LLMClient:
         response = None
         buffer = ""
         emitted = set()
+        stream_usage = {}
+        stream_error = ""
         start = time.monotonic()
 
         def take_complete_candidates(final=False):
@@ -600,6 +646,8 @@ class LLMClient:
                 except json.JSONDecodeError:
                     buffer += line
                 else:
+                    if isinstance(event.get("usage"), dict):
+                        stream_usage = event["usage"]
                     self.log_usage(event.get("usage"), label="LLM stream")
                     choices = event.get("choices") or []
                     if not choices:
@@ -627,7 +675,18 @@ class LLMClient:
                 int((time.monotonic() - start) * 1000),
                 len(emitted),
             )
+        except Exception as exc:
+            stream_error = str(exc)
+            raise
         finally:
+            self.record_stats(
+                "stream",
+                start,
+                bool(emitted) and not stream_error,
+                usage=stream_usage,
+                candidate_count=len(emitted),
+                error=stream_error,
+            )
             if response is not None:
                 response.close()
             session.close()
@@ -738,7 +797,7 @@ class LLMClient:
             return ""
         if self.max_history_chars:
             text = text[-self.max_history_chars :]
-        return "之前输入的内容:" + text
+        return text
 
     def format_recent_committed_turns(self, turns):
         result = []

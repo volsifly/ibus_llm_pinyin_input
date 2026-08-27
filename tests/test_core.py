@@ -8,6 +8,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from ibus_ai_pinyin.cache import CandidateCache
+from ibus_ai_pinyin.config import load_config, save_user_config
 from ibus_ai_pinyin.candidate_ranker import merge_candidates
 from ibus_ai_pinyin.dictionary_format import normalize_dictionary
 from ibus_ai_pinyin.dictionary_store import DomainDictionaryStore
@@ -16,6 +17,7 @@ from ibus_ai_pinyin.local_candidates import get_local_candidates
 from ibus_ai_pinyin.llm_client import LLMClient
 import ibus_ai_pinyin.llm_client as llm_client_module
 from ibus_ai_pinyin.user_memory import UserMemoryStore, count_han, pinyin_short
+from ibus_ai_pinyin.stats import LLMStatsStore
 from engine import AIPinyinEngine
 
 import gi
@@ -42,6 +44,62 @@ def test_parse_candidates():
         ["鸿灵知识库检索功能", "鸿灵知识库搜索功能"],
         [{"text": "鸿灵", "weight": 85}, {"text": "知识库", "weight": 90}, {"text": "搜索", "weight": 85}],
     ) == ["鸿灵知识库搜索功能", "鸿灵知识库检索功能"]
+
+
+def test_active_llm_profile_overrides_legacy_api():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "config.json")
+        save_user_config(
+            {
+                "api": {
+                    "model": "legacy",
+                    "endpoint": "/responses",
+                    "temperature": 0.2,
+                    "stream_timeout_ms": 4321,
+                },
+                "active_llm_profile": "fast",
+                "llm_profiles": [
+                    {
+                        "id": "fast",
+                        "name": "快速",
+                        "api": {
+                            "model": "fast-model",
+                            "base_url": "http://fast/v1",
+                            "endpoint": "/custom",
+                            "temperature": 1.5,
+                            "stream_timeout_ms": 9999,
+                        },
+                    },
+                    {"id": "smart", "name": "聪明", "api": {"model": "smart-model"}},
+                ],
+            },
+            path,
+        )
+        config = load_config(path)
+        assert config["api"]["model"] == "fast-model"
+        assert config["api"]["base_url"] == "http://fast/v1"
+        assert config["api"]["endpoint"] == "/chat/completions"
+        assert config["api"]["temperature"] == 0.2
+        assert config["api"]["stream_timeout_ms"] == 4321
+
+
+def test_llm_stats_store_records_and_summarizes():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = LLMStatsStore(os.path.join(tmpdir, "stats.sqlite3"))
+        store.record("fast", "m1", "stream", True, 120, {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}, 9)
+        store.record("fast", "m1", "stream", False, 300, {}, 0, "timeout")
+        summary = store.summary(30)
+        assert summary["calls"] == 2
+        assert summary["successes"] == 1
+        assert summary["total_tokens"] == 15
+        assert summary["avg_latency_ms"] == 210
+        assert store.recent(1)[0]["error"] == "timeout"
+        store.record("smart", "m2", "stream", True, 90, {"total_tokens": 8}, 8)
+        grouped = store.grouped_by_model(30)
+        assert [row["model"] for row in grouped] == ["m1", "m2"]
+        assert grouped[0]["calls"] == 2
+        assert grouped[0]["avg_latency_ms"] == 210
+        assert grouped[0]["total_tokens"] == 15
 
 
 def test_extract_complete_candidates_from_partial_json():
@@ -107,7 +165,9 @@ def test_build_request_body_includes_recent_committed_text():
     )
 
     system_content = body["messages"][0]["content"]
-    assert "之前输入的内容:鸿灵,知识库" in system_content
+    assert "鸿灵,知识库" in system_content
+    assert "之前输入的内容:" not in system_content
+    assert "{history}" not in system_content
     assert "输入了内容是" not in system_content
     assert "hongling" not in system_content
     assert "zhishiku" not in system_content
@@ -117,6 +177,23 @@ def test_build_request_body_includes_recent_committed_text():
     assert "tools" not in body
     assert "tool_choice" not in body
     assert "response_format" not in body
+
+
+def test_system_history_placeholder_controls_history_position():
+    client = LLMClient(
+        {
+            "api": {},
+            "prompt": {
+                "system": "规则开始\n{history}\n规则结束",
+                "user_template": "现在输入:{pinyin}",
+            },
+        }
+    )
+    body = client.build_request_body(
+        "nihao",
+        recent_committed_turns=[{"pinyin": "shijie", "text": "世界"}],
+    )
+    assert body["messages"][0]["content"] == "规则开始\n世界\n规则结束"
 
 
 def test_build_request_body_includes_surrounding_context():
@@ -136,7 +213,7 @@ def test_build_request_body_includes_surrounding_context():
     assert "B:" not in user_content
 
 
-def test_prompt_config_is_ignored():
+def test_prompt_config_is_applied():
     client = LLMClient(
         {
             "api": {},
@@ -148,10 +225,8 @@ def test_prompt_config_is_ignored():
     )
     body = client.build_request_body("nihao")
 
-    assert "不要使用这个" not in body["messages"][0]["content"]
-    assert "不要使用这个" not in body["messages"][-1]["content"]
-    assert "以|分隔" in body["messages"][0]["content"]
-    assert body["messages"][-1]["content"] == "现在输入:nihao"
+    assert body["messages"][0]["content"] == "不要使用这个 system"
+    assert body["messages"][-1]["content"] == "不要使用这个 user nihao"
 
 
 def test_deepseek_request_body_uses_cache_friendly_layout():
@@ -173,7 +248,8 @@ def test_deepseek_request_body_uses_cache_friendly_layout():
     )
     user_content = body["messages"][-1]["content"]
 
-    assert "之前输入的内容:继续" in body["messages"][0]["content"]
+    assert "继续" in body["messages"][0]["content"]
+    assert "之前输入的内容:" not in body["messages"][0]["content"]
     assert "拼音：jixu" not in body["messages"][0]["content"]
     assert user_content == "现在输入:hongling"
     assert "tools" not in body
@@ -199,7 +275,8 @@ def test_deepseek_cache_layout_can_be_disabled():
     )
     user_content = body["messages"][-1]["content"]
 
-    assert "之前输入的内容:继续" in body["messages"][0]["content"]
+    assert "继续" in body["messages"][0]["content"]
+    assert "之前输入的内容:" not in body["messages"][0]["content"]
     assert "拼音：jixu" not in body["messages"][0]["content"]
     assert "hongling" in user_content
 
@@ -910,11 +987,14 @@ def test_ctrl_digit_index_accepts_number_rows_and_keypad():
 
 if __name__ == "__main__":
     test_parse_candidates()
+    test_active_llm_profile_overrides_legacy_api()
+    test_llm_stats_store_records_and_summarizes()
     test_extract_complete_candidates_from_partial_json()
     test_stream_candidates_emits_on_delimiter()
     test_build_request_body_includes_recent_committed_text()
+    test_system_history_placeholder_controls_history_position()
     test_build_request_body_includes_surrounding_context()
-    test_prompt_config_is_ignored()
+    test_prompt_config_is_applied()
     test_deepseek_request_body_uses_cache_friendly_layout()
     test_deepseek_cache_layout_can_be_disabled()
     test_cache_promote()

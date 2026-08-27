@@ -9,9 +9,11 @@ CONFIG_DIR="${HOME}/.config/ibus-ai-pinyin"
 mkdir -p "${INSTALL_DIR}/ibus_ai_pinyin" "${COMPONENT_DIR}" "${CONFIG_DIR}"
 
 cp "${ROOT_DIR}/engine.py" "${INSTALL_DIR}/engine.py"
+cp "${ROOT_DIR}/settings.py" "${INSTALL_DIR}/settings.py"
 cp "${ROOT_DIR}/run-engine.sh" "${INSTALL_DIR}/run-engine.sh"
 cp "${ROOT_DIR}/ibus_ai_pinyin/"*.py "${INSTALL_DIR}/ibus_ai_pinyin/"
 chmod +x "${INSTALL_DIR}/engine.py"
+chmod +x "${INSTALL_DIR}/settings.py"
 chmod +x "${INSTALL_DIR}/run-engine.sh"
 
 sed "s#__INSTALL_DIR__#${INSTALL_DIR}#g" \

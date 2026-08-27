@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 import logging
+from logging.handlers import RotatingFileHandler
 import os
+import subprocess
 import threading
 import time
+
+import requests
 
 import gi
 
@@ -21,6 +25,7 @@ from ibus_ai_pinyin.user_memory import UserMemoryStore
 
 LOG_PATH = os.path.expanduser("~/.cache/ibus-ai-pinyin/engine.log")
 INPUT_MODE_PROP_KEY = "InputMode"
+SETTINGS_PROP_KEY = "Settings"
 PASSTHROUGH_MODIFIERS = (
     IBus.ModifierType.CONTROL_MASK
     | IBus.ModifierType.MOD1_MASK
@@ -59,11 +64,17 @@ def merge_context_items(*groups):
 
 def setup_logging():
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
-    logging.basicConfig(
-        filename=LOG_PATH,
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
+    handler = RotatingFileHandler(
+        LOG_PATH,
+        maxBytes=10 * 1024 * 1024,
+        backupCount=1,
+        encoding="utf-8",
     )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+    root.addHandler(handler)
 
 
 class AIPinyinEngine(IBus.Engine):
@@ -393,6 +404,7 @@ class AIPinyinEngine(IBus.Engine):
     def register_mode_property(self):
         prop_list = IBus.PropList()
         prop_list.append(self.create_mode_property())
+        prop_list.append(self.create_settings_property())
         self.register_properties(prop_list)
         logging.debug("mode property registered mode=%s", "zh" if self.zh_mode else "en")
 
@@ -416,6 +428,30 @@ class AIPinyinEngine(IBus.Engine):
             symbol=symbol,
         )
         return prop
+
+    def create_settings_property(self):
+        return IBus.Property(
+            key=SETTINGS_PROP_KEY,
+            type=IBus.PropType.NORMAL,
+            label="设置",
+            icon="preferences-system",
+            tooltip="打开 AI 拼音输入法设置",
+            sensitive=True,
+            visible=True,
+            state=IBus.PropState.UNCHECKED,
+            symbol="⚙",
+        )
+
+    def do_property_activate(self, prop_name, prop_state):
+        if prop_name == INPUT_MODE_PROP_KEY:
+            self.toggle_input_mode()
+            return
+        if prop_name == SETTINGS_PROP_KEY:
+            settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.py")
+            try:
+                subprocess.Popen([settings_path], start_new_session=True)
+            except Exception as exc:
+                logging.warning("settings launch failed: %s", exc)
 
     def update_composition_ui(self, suffix=""):
         self.update_preedit_text(IBus.Text.new_from_string(""), 0, False)
@@ -681,7 +717,6 @@ class AIPinyinEngine(IBus.Engine):
 
         pinyin = " ".join(self.buffer.split())
         max_candidates = self.config.get("candidate", {}).get("max_candidates", 5)
-        logging.info("candidate request started chars=%s", len(pinyin))
 
         dictionary_context = []
         user_context = []
@@ -694,16 +729,12 @@ class AIPinyinEngine(IBus.Engine):
                     limit=max_candidates,
                 )
                 knowledge_candidate_labels.update(user_exact_candidates)
-                if user_exact_candidates:
-                    logging.info("user memory exact candidate count=%s", len(user_exact_candidates))
             if self.memory_cfg.get("send_to_llm", True):
                 user_context = self.user_memory.get_context_items(
                     pinyin,
                     limit=self.memory_cfg.get("max_context_terms", 8),
                 )
                 knowledge_candidate_labels.update(item.get("text") for item in user_context if item.get("text"))
-                if user_context:
-                    logging.info("user memory context count=%s", len(user_context))
 
         if self.dictionary_enabled:
             dictionary_candidates = self.dictionary.get_candidates(
@@ -716,22 +747,16 @@ class AIPinyinEngine(IBus.Engine):
             )
             knowledge_candidate_labels.update(dictionary_candidates)
             knowledge_candidate_labels.update(item.get("text") for item in dictionary_context if item.get("text"))
-            if dictionary_context:
-                logging.info("domain dictionary context count=%s", len(dictionary_context))
         self.knowledge_candidate_labels = knowledge_candidate_labels
 
         cached = []
         if self.cache_enabled:
             cached = self.cache.get(pinyin, limit=max_candidates)
             self.cached_candidate_labels = set(cached)
-            if cached:
-                logging.info("candidate cache hit count=%s", len(cached))
         else:
             self.cached_candidate_labels = set()
 
         local_candidates = get_local_candidates(pinyin, limit=max_candidates)
-        if local_candidates:
-            logging.info("local candidates immediate count=%s", len(local_candidates))
 
         merged = merge_candidates(
             user_exact_candidates,
@@ -748,8 +773,6 @@ class AIPinyinEngine(IBus.Engine):
         )
         llm_context = merge_context_items(user_context, dictionary_context)
         recent_committed_turns = self.get_recent_committed_context()
-        if recent_committed_turns:
-            logging.info("recent committed context turns=%s", len(recent_committed_turns))
         surrounding_context = self.get_input_surrounding_context()
         if len(high_confidence_candidates) >= max_candidates or (
             not llm_context and len(merged) >= max_candidates
@@ -934,27 +957,34 @@ class AIPinyinEngine(IBus.Engine):
     ):
         candidates = []
         try:
-            for candidate in self.llm.stream_candidates(
-                pinyin,
-                max_candidates=max_candidates,
-                dictionary_context=dictionary_context or [],
-                recent_committed_turns=recent_committed_turns or [],
-                surrounding_context=surrounding_context or {},
-            ):
-                if candidate in candidates:
-                    continue
-                candidates.append(candidate)
-                GLib.idle_add(
-                    self.on_candidates_delta,
-                    request_id,
-                    pinyin,
-                    list(candidates),
-                    cached or [],
-                    local_candidates or [],
-                    dictionary_context or [],
-                    max_candidates,
-                )
-            logging.info("LLM candidates ready count=%s", len(candidates))
+            for attempt in range(2):
+                try:
+                    for candidate in self.llm.stream_candidates(
+                        pinyin,
+                        max_candidates=max_candidates,
+                        dictionary_context=dictionary_context or [],
+                        recent_committed_turns=recent_committed_turns or [],
+                        surrounding_context=surrounding_context or {},
+                    ):
+                        if candidate in candidates:
+                            continue
+                        candidates.append(candidate)
+                        GLib.idle_add(
+                            self.on_candidates_delta,
+                            request_id,
+                            pinyin,
+                            list(candidates),
+                            cached or [],
+                            local_candidates or [],
+                            dictionary_context or [],
+                            max_candidates,
+                        )
+                    break
+                except requests.Timeout:
+                    if attempt == 0:
+                        logging.warning("LLM stream timed out, retrying immediately")
+                        continue
+                    raise
             if not candidates:
                 logging.info("LLM stream returned no candidates, using non-stream fallback")
                 candidates = self.llm.get_candidates(
@@ -966,7 +996,7 @@ class AIPinyinEngine(IBus.Engine):
                 )
         except Exception as exc:
             logging.warning("LLM stream request failed: %s", exc)
-            if not candidates:
+            if not candidates and not isinstance(exc, requests.Timeout):
                 try:
                     candidates = self.llm.get_candidates(
                         pinyin,
@@ -1104,7 +1134,6 @@ class AIPinyinEngine(IBus.Engine):
 
         self.update_lookup_table(table, True)
         self.update_composition_ui()
-        logging.info("lookup table shown count=%s", len(candidates))
 
     def format_candidate_label(self, candidate):
         markers = []

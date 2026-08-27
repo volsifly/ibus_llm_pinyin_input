@@ -10,7 +10,7 @@
 
 - 支持 OpenAI-compatible Chat Completions API。
 - 支持本地 llama.cpp、Ollama、DeepSeek、OpenRouter 等兼容服务。
-- 通过 OpenAI-compatible Function Calling 强制模型调用 `submit_pinyin_candidates` 返回 5 个候选。
+- 支持 OpenAI-compatible SSE 流式返回，以 `|` 分隔并增量展示 18 个候选。
 - 会把已上屏历史文本和当前输入框光标前后文放入 system content，辅助模型判断语境。
 - 拼音输入期间不把原始拼音写入当前输入框，只在 IBus 弹出区域显示输入内容和候选。
 - 用户选择候选后才提交中文到输入框。
@@ -120,6 +120,26 @@ fcitx5 -r
 
 ## 配置
 
+### 图形配置界面
+
+安装后可以从 IBus 面板中的“设置”打开 GTK4 配置界面，也可以直接运行：
+
+```bash
+~/.local/share/ibus-ai-pinyin/settings.py
+```
+
+界面支持：
+
+- 创建、删除和切换多个 LLM 配置
+- 每个模型单独配置 Base URL、模型名称和 API Key；下拉列表直接显示模型名称
+- 通用配置超时、采样参数、最大输出 Token、流式输出、系统代理和请求正文日志
+- Endpoint 固定为 `/chat/completions`，模型配置不能覆盖
+- 编辑包含 `{history}` 的 system 提示词与包含 `{pinyin}` 的 user 模板
+- 手动刷新查看 `~/.cache/ibus-ai-pinyin/engine.log`，日志视图不会自动滚动
+- 按相同模型汇总最近 30 天调用次数、成功率、Token 消耗和平均响应耗时
+
+Token 和耗时统计保存在配置目录的 SQLite 数据库中。API Key 只写入本机配置文件，不写入运行日志或统计表。
+
 首次启动会生成：
 
 ```text
@@ -143,11 +163,12 @@ ibus engine ai-pinyin
     "api_key_env": "OPENAI_API_KEY",
     "model": "qwen3-0.6b",
     "endpoint": "/chat/completions",
-    "timeout_ms": 800,
+    "timeout_ms": 5000,
+    "stream_timeout_ms": 5000,
     "temperature": 0.1,
     "top_p": 0.8,
     "max_tokens": 64,
-    "stream": false,
+    "stream": true,
     "proxy_enabled": false,
     "thinking": {
       "enabled": false,
@@ -162,9 +183,9 @@ ibus engine ai-pinyin
   },
   "input": {
     "max_buffer_length": 120,
-    "candidate_page_size": 5,
-    "recent_context_items": 10,
-    "recent_context_chars": 0,
+    "candidate_page_size": 9,
+    "recent_context_items": 6,
+    "recent_context_chars": 80,
     "recent_context_idle_timeout_seconds": 1800,
     "surrounding_context_enabled": true,
     "surrounding_context_before_chars": 80,
@@ -176,6 +197,14 @@ ibus engine ai-pinyin
       "modifiers": ["Control"]
     }
   },
+  "candidate": {
+    "max_candidates": 18,
+    "fallback_to_raw_pinyin": true
+  },
+  "prompt": {
+    "system": "拼音转中文。输出18个按概率排序的候选，以|分隔，无解释。可保留英文、数字和符号。\n\n{history}",
+    "user_template": "现在输入:{pinyin}"
+  },
   "dictionary": {
     "enabled": true,
     "path": "~/.config/ibus-ai-pinyin/cache.sqlite3",
@@ -184,7 +213,7 @@ ibus engine ai-pinyin
 }
 ```
 
-模型提示词和 `submit_pinyin_candidates` 工具定义固定在 `ibus_ai_pinyin/llm_client.py` 中，不读取 `config.json` 的 `prompt` 配置。修改仓库中的提示词后，需要先重新安装再重启 IBus：
+图形界面保存后可选择“保存并重启 IBus”。从仓库修改代码后，需要重新安装再重启：
 
 ```bash
 ./scripts/install-user.sh
@@ -203,9 +232,10 @@ IBus 实际运行的是 `~/.local/share/ibus-ai-pinyin` 下的安装副本，只
     "api_key": "sk-...",
     "model": "deepseek-v4-flash",
     "endpoint": "/chat/completions",
-    "timeout_ms": 15000,
+    "timeout_ms": 5000,
+    "stream_timeout_ms": 5000,
     "max_tokens": 256,
-    "stream": false,
+    "stream": true,
     "proxy_enabled": false,
     "thinking": {
       "enabled": false,
@@ -235,7 +265,7 @@ IBus 实际运行的是 `~/.local/share/ibus-ai-pinyin` 下的安装副本，只
 
 `deepseek-v4-flash` / `deepseek-v4-pro` 使用 DeepSeek 服务端自动上下文缓存。`api.cache_optimization.enabled=auto` 时，客户端会在检测到 DeepSeek base URL 或模型名后使用缓存友好的 user content 布局。历史输入和输入框上下文位于 system content，当前拼音位于最后一条 user message。
 
-Function Calling 请求统一使用 `stream=false`，避免不同兼容服务对流式 tool call 增量格式支持不一致。配置中的 `api.stream` 当前不会开启模型流式响应。
+默认协议不使用 Tool Call 或 JSON 数组。模型直接输出以 `|` 分隔的候选，客户端解析 SSE 增量并立即显示完整候选。流式请求 5 秒超时后会立即重试一次；第二次仍超时就停止远程请求并使用已有或本地候选。
 
 日志会记录 DeepSeek 返回的 `prompt_cache_hit_tokens` 和 `prompt_cache_miss_tokens`，用于确认缓存是否命中。如果通过转发服务调用 DeepSeek 且 URL/模型名里不含 `deepseek`，可以显式设置：
 
@@ -269,7 +299,7 @@ Function Calling 请求统一使用 `stream=false`，避免不同兼容服务对
 }
 ```
 
-提示词不能通过配置覆盖；需要直接修改 `ibus_ai_pinyin/llm_client.py` 中的 `SYSTEM_PROMPT` 和 `USER_TEMPLATE`。
+提示词可以在图形配置界面修改。system 模板必须保留 `{history}`，user 模板必须保留 `{pinyin}`。
 
 ### 中英文切换快捷键
 
@@ -354,7 +384,7 @@ llama-server \
 按 - 或 = 排除当前候选并生成下一组候选
 按 1-9 选择候选
 按 Ctrl+1 到 Ctrl+9 修改对应候选
-选中带 * 的缓存候选后按 Delete 删除该缓存
+选中候选后按 Delete 删除该词；缓存、用户动态词库和领域词库中的同名词都会清理
 按空格提交当前第一个候选
 按回车提交当前候选或原始拼音
 按 Esc 清空
@@ -373,13 +403,13 @@ llama-server \
 
 用户每次选择候选并上屏后，输入法会在内存中记录最终选择的中文结果。未选中的候选不会写入历史上下文，历史拼音也不会发送给模型。
 
-下一次调用 LLM 时，已上屏候选会按顺序拼成连续文本，并放入 system content，例如用户依次输入“输入”“了”“什么”“东西”：
+下一次调用 LLM 时，已上屏候选会用逗号连接，并替换 system 模板中的 `{history}`。例如模板为 `之前用户输入的内容是:"{history}"`，用户依次输入“输入”“了”“什么”“东西”时，实际内容为：
 
 ```text
-历史输入："输入了什么东西"
+之前用户输入的内容是:"输入,了,什么,东西"
 ```
 
-历史轮次只保存在当前 engine 进程内，重启输入法后会清空。默认最多保留最近 `input.recent_context_items=10` 轮，`input.recent_context_chars=0` 表示不按字符数截断。如果超过 `input.recent_context_idle_timeout_seconds=1800` 秒没有输入，下一次输入时会先清空历史轮次。
+`{history}` 只代表纯历史文本，不自带“之前输入的内容”等前缀，说明文字和标点由 system 模板控制。历史轮次只保存在当前 engine 进程内，重启输入法后会清空。默认最多保留最近 `input.recent_context_items=6` 轮，并按 `input.recent_context_chars=80` 限制字符数。如果超过 `input.recent_context_idle_timeout_seconds=1800` 秒没有输入，下一次输入时会先清空历史轮次。
 
 ### 当前输入框上下文
 
@@ -393,17 +423,9 @@ llama-server \
 
 默认最多发送光标前 80 个字符和光标后 40 个字符，可通过 `input.surrounding_context_before_chars`、`input.surrounding_context_after_chars` 调整，或将 `input.surrounding_context_enabled` 设为 `false` 关闭。应用不支持 surrounding text、密码框或敏感输入框不提供上下文时，输入法会自动降级为空上下文。
 
-### 模型工具调用
+### 模型输出协议
 
-所有候选请求都会提供并强制选择 `submit_pinyin_candidates` 工具：
-
-```json
-{
-  "candidates": ["候选1", "候选2", "候选3", "候选4", "候选5"]
-}
-```
-
-客户端优先解析 `message.tool_calls[].function.arguments.candidates`。为兼容暂时不支持 Function Calling 的旧服务，也保留从普通 `content` JSON 中解析候选的兜底逻辑。
+默认要求模型直接返回 18 个候选，以 `|` 分隔，例如 `你好|您好|你号`。流式解析器会忽略 SSE 的注释和 `event:`、`id:`、`retry:` 控制行，并在收到每个完整候选后立即更新候选窗。兼容代码仍能解析 JSON 或 Tool Call 响应，但默认请求不发送工具定义。
 
 数字键按输入状态区分处理：没有拼音缓冲区时直接输入数字；已经开始输入拼音后，数字会进入缓冲区；候选列表显示时，`1-9` 继续用于选择候选。
 
@@ -568,9 +590,9 @@ SQLite 历史缓存
 
 词库本身不直接输出候选。当长输入命中领域词上下文时，缓存不会直接截断请求，输入法仍会调用 LLM 补充结果；缓存只作为后备候选参与融合，避免旧缓存污染覆盖新的词库纠错结果。
 
-LLM 首轮仍强制请求 5 个候选；候选窗不会把用户动态词、SQLite 历史缓存、本地兜底和 LLM 结果的融合列表截断到 5 个。融合后超过 `candidate_page_size` 时，IBus 候选窗会分页显示全部候选。
+LLM 首轮请求 18 个候选，IBus 候选窗每页显示 9 个。融合用户动态词、SQLite 历史缓存、本地兜底和 LLM 结果后，超过一页可以翻页；翻到已有候选不足的页面时才继续请求更多候选。
 
-SQLite 历史缓存只记录用户实际选择并上屏的候选，不会把 LLM 每次输出的整组候选全部写入缓存。来自 SQLite 历史缓存的候选会在候选窗中显示 `*` 标识；命中用户动态词库或领域词库的候选会显示 `#` 标识。如果同一个候选同时来自缓存和知识库，会同时显示两个标识。候选窗显示时，选中某个缓存候选后按 `Delete` 可以从 SQLite 缓存中删除该候选；这只删除历史候选缓存，不会删除领域词库、本地兜底词或用户动态词库条目。
+SQLite 历史缓存只记录用户实际选择并上屏的候选，不会把 LLM 每次输出的整组候选全部写入缓存。来自 SQLite 历史缓存的候选会在候选窗中显示 `*` 标识；命中用户动态词库或领域词库的候选会显示 `#` 标识。如果同一个候选同时来自缓存和知识库，会同时显示两个标识。候选窗显示时，按 `Delete` 会跨 SQLite 缓存、用户动态词库和领域词库删除所选词。
 
 ## 日志和缓存
 
@@ -586,7 +608,9 @@ SQLite 历史缓存只记录用户实际选择并上屏的候选，不会把 LLM
 ~/.config/ibus-ai-pinyin/cache.sqlite3
 ```
 
-日志会记录完整 LLM request body（不含 Authorization）、模型请求耗时、HTTP 状态、原始输出和解析后的候选，便于检查 system/user content、输入框上下文和工具定义。日志可能包含当前输入框文字、历史输入及模型返回内容，调试完成后可以按需清理：
+开启“记录请求正文”后，日志会记录 LLM request body（不含 Authorization）；常规日志保留模型请求耗时、HTTP 状态、超时重试和错误。候选窗刷新、缓存命中等高频流水日志不会记录。日志使用滚动文件，`engine.log` 单文件最大 10 MB，并保留一个 `engine.log.1` 历史文件。设置界面只在打开或点击“刷新”时读取最近 500 行，不会自动刷新或滚动。
+
+请求正文可能包含当前输入框文字和历史输入，调试完成后建议关闭该开关。需要手工清理时可以运行：
 
 ```bash
 truncate -s 0 ~/.cache/ibus-ai-pinyin/engine.log

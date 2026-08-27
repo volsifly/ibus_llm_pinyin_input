@@ -6,6 +6,10 @@ import os
 CONFIG_DIR = "~/.config/ibus-ai-pinyin"
 CONFIG_PATH = "~/.config/ibus-ai-pinyin/config.json"
 
+DEFAULT_SYSTEM_PROMPT = "拼音转中文。输出18个按概率排序的候选，以|分隔，无解释。可保留英文、数字和符号。\n\n{history}"
+DEFAULT_USER_TEMPLATE = "现在输入:{pinyin}"
+LLM_PROFILE_API_KEYS = ("base_url", "model", "api_key", "api_key_env")
+
 
 DEFAULT_CONFIG = {
     "api": {
@@ -14,7 +18,7 @@ DEFAULT_CONFIG = {
         "api_key_env": "OPENAI_API_KEY",
         "model": "qwen3-0.6b",
         "endpoint": "/chat/completions",
-        "timeout_ms": 800,
+        "timeout_ms": 5000,
         "temperature": 0.1,
         "top_p": 0.8,
         "max_tokens": 64,
@@ -33,6 +37,12 @@ DEFAULT_CONFIG = {
             "log_usage": True,
         },
         "extra_body": {},
+    },
+    "active_llm_profile": "default",
+    "llm_profiles": [],
+    "prompt": {
+        "system": DEFAULT_SYSTEM_PROMPT,
+        "user_template": DEFAULT_USER_TEMPLATE,
     },
     "input": {
         "max_buffer_length": 120,
@@ -55,6 +65,10 @@ DEFAULT_CONFIG = {
         "fallback_to_raw_pinyin": True,
     },
     "cache": {
+        "enabled": True,
+        "path": "~/.config/ibus-ai-pinyin/cache.sqlite3",
+    },
+    "stats": {
         "enabled": True,
         "path": "~/.config/ibus-ai-pinyin/cache.sqlite3",
     },
@@ -103,8 +117,43 @@ def load_config(path=CONFIG_PATH):
         os.makedirs(os.path.dirname(expanded_path), exist_ok=True)
         with open(expanded_path, "w", encoding="utf-8") as f:
             json.dump(DEFAULT_CONFIG, f, ensure_ascii=False, indent=2)
+        os.chmod(expanded_path, 0o600)
         return copy.deepcopy(DEFAULT_CONFIG)
 
     with open(expanded_path, "r", encoding="utf-8") as f:
         user_config = json.load(f)
-    return deep_merge(DEFAULT_CONFIG, user_config)
+    config = deep_merge(DEFAULT_CONFIG, user_config)
+    config["api"]["endpoint"] = DEFAULT_CONFIG["api"]["endpoint"]
+    active_id = config.get("active_llm_profile", "default")
+    for profile in config.get("llm_profiles", []):
+        if isinstance(profile, dict) and profile.get("id") == active_id:
+            profile_api = profile.get("api", {})
+            if not isinstance(profile_api, dict):
+                profile_api = {}
+            connection_config = {
+                key: profile_api[key]
+                for key in LLM_PROFILE_API_KEYS
+                if key in profile_api
+            }
+            config["api"] = deep_merge(config.get("api", {}), connection_config)
+            break
+    return config
+
+
+def load_user_config(path=CONFIG_PATH):
+    expanded_path = os.path.expanduser(path)
+    if not os.path.exists(expanded_path):
+        load_config(path)
+    with open(expanded_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_user_config(config, path=CONFIG_PATH):
+    expanded_path = os.path.expanduser(path)
+    os.makedirs(os.path.dirname(expanded_path), exist_ok=True)
+    temp_path = expanded_path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(temp_path, expanded_path)
+    os.chmod(expanded_path, 0o600)
